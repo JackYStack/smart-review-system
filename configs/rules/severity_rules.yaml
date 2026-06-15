@@ -1,0 +1,19 @@
+severity:
+  A:
+    label: 红线问题
+    requires_human_review: true
+    examples:
+      - 违反强制性条文
+      - 超规模危大工程缺少专家论证
+  B:
+    label: 重要缺项
+    requires_human_review: true
+    examples:
+      - 关键参数缺失
+      - 证据链不完整
+  C:
+    label: 一般问题
+    requires_human_review: false
+    examples:
+      - 表述不一致
+      - 页码引用缺失

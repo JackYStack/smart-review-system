@@ -1,0 +1,15 @@
+# 文档解析模块
+backend/app/services/parse/ @zhangruicheng
+
+# RAG 与大模型模块
+backend/app/services/rag/ @luoyaqi
+backend/app/services/llm/ @luoyaqi
+backend/app/services/llm/prompts/ @luoyaqi
+
+# 规则引擎与公式验算
+backend/app/services/rules/ @zhangruicheng @luoyaqi
+backend/app/services/formula/ @zhangruicheng
+
+# 数据处理与配置
+data_pipeline/ @zhangwei
+configs/ @zhangwei

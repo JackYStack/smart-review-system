@@ -1,0 +1,13 @@
+scenario: scaffold_landed
+name: 落地式钢管脚手架
+priority: P0
+thresholds:
+  erection_height_m: 24
+required_sections:
+  - 工程概况
+  - 编制依据
+  - 施工计划
+  - 施工工艺技术
+  - 施工安全保证措施
+  - 劳动力计划
+  - 计算书

@@ -1,0 +1,18 @@
+scenario: scaffold
+parameters:
+  - name: erection_height
+    label: 搭设高度
+    unit: m
+    required: true
+  - name: pole_longitudinal_spacing
+    label: 立杆纵距
+    unit: m
+    required: true
+  - name: pole_transverse_spacing
+    label: 立杆横距
+    unit: m
+    required: true
+  - name: wall_tie_spacing
+    label: 连墙件间距
+    unit: m
+    required: true

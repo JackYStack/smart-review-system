@@ -1,0 +1,7 @@
+{
+  "scenario": "scaffold_cantilever",
+  "name": "悬挑式脚手架",
+  "thresholds": {
+    "erection_height_m": 20
+  }
+}
