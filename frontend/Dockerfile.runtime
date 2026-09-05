@@ -1,0 +1,11 @@
+ARG NGINX_IMAGE=nginx:1.31.4-alpine
+
+FROM ${NGINX_IMAGE}
+
+# This runtime-only image consumes the locally verified Vite production build.
+# It is useful for controlled/offline deployments where package registries are
+# unavailable; CI continues to use Dockerfile and performs the full source build.
+COPY nginx.conf /etc/nginx/templates/default.conf.template
+COPY dist /usr/share/nginx/html
+
+EXPOSE 80

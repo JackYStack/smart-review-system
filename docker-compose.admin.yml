@@ -1,0 +1,19 @@
+# Optional loopback-only maintenance ports. Do not use this overlay on a public
+# server. Access remains limited to the deployment host (127.0.0.1).
+services:
+  mysql:
+    ports:
+      - "127.0.0.1:${MYSQL_ADMIN_PORT:-3306}:3306"
+
+  minio:
+    ports:
+      - "127.0.0.1:${MINIO_ADMIN_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_ADMIN_CONSOLE_PORT:-9001}:9001"
+
+  onlyoffice:
+    ports:
+      - "127.0.0.1:${ONLYOFFICE_ADMIN_PORT:-9080}:80"
+
+  paddleocr:
+    ports:
+      - "127.0.0.1:${PADDLEOCR_ADMIN_PORT:-8080}:8080"

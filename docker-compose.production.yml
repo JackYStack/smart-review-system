@@ -1,0 +1,54 @@
+# Production HTTPS overlay. It keeps the demo compose defaults intact while
+# replacing the frontend host port with a dedicated TLS gateway.
+#
+# Required: PUBLIC_HOSTNAME and certificate files under deploy/certs/.
+services:
+  backend:
+    environment:
+      CORS_ORIGINS: https://${PUBLIC_HOSTNAME}
+      MINIO_ENDPOINT: ${PUBLIC_HOSTNAME}:443
+      MINIO_SECURE: "true"
+      ONLYOFFICE_DOCS_URL: https://${PUBLIC_HOSTNAME}/office
+
+  worker:
+    environment:
+      CORS_ORIGINS: https://${PUBLIC_HOSTNAME}
+      MINIO_ENDPOINT: ${PUBLIC_HOSTNAME}:443
+      MINIO_SECURE: "true"
+      ONLYOFFICE_DOCS_URL: https://${PUBLIC_HOSTNAME}/office
+
+  frontend:
+    ports: !reset []
+
+  gateway:
+    image: nginx:${NGINX_IMAGE_TAG:-1.31.4-alpine}
+    restart: unless-stopped
+    depends_on:
+      frontend:
+        condition: service_healthy
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME}
+      NGINX_ENVSUBST_FILTER: PUBLIC_HOSTNAME
+    ports:
+      - "${PUBLIC_BIND_ADDRESS:-0.0.0.0}:80:80"
+      - "${PUBLIC_BIND_ADDRESS:-0.0.0.0}:443:443"
+    volumes:
+      - ./deploy/nginx/https.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./deploy/certs/fullchain.pem:/etc/nginx/tls/fullchain.pem:ro
+      - ./deploy/certs/privkey.pem:/etc/nginx/tls/privkey.pem:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "-q", "--spider", "https://127.0.0.1/api/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    mem_limit: ${GATEWAY_MEMORY_LIMIT:-256m}
+    cpus: ${GATEWAY_CPU_LIMIT:-1.0}
+    pids_limit: ${GATEWAY_PIDS_LIMIT:-128}
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE:-20m}
+        max-file: ${LOG_MAX_FILES:-5}

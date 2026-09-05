@@ -1,0 +1,23 @@
+# 离线完整演示：只启动前端，使用 frontend/src/demo/demoApi.ts 中的可重复演示数据。
+# 不需要 MySQL、MinIO、PaddleOCR 或 Dify，适合队友解压后立刻打开查看系统界面。
+services:
+  frontend-demo:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.demo
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22.23.2-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.31.4-alpine}
+    image: smartreview-frontend-demo:0.2.0
+    restart: unless-stopped
+    ports:
+      - "${DEMO_HTTP_PORT:-5173}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+

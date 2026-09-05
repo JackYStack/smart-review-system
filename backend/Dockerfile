@@ -1,14 +1,16 @@
-FROM python:3.11-slim
+ARG PYTHON_IMAGE=python:3.11.16-slim-bookworm
+FROM ${PYTHON_IMAGE}
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir uv
+COPY requirements.txt .
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libreoffice-writer fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY pyproject.toml ./
-RUN uv sync --no-dev
+COPY . .
 
-COPY app ./app
+ENV PYTHONUNBUFFERED=1
 
-EXPOSE 8002
-
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002"]
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]

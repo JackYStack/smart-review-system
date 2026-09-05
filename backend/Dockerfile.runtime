@@ -1,0 +1,15 @@
+ARG BASE_IMAGE=smartreview-backend:0.2.0
+
+FROM ${BASE_IMAGE}
+
+# Refresh application source on top of an already dependency-verified image.
+# This supports controlled/offline deployments when public registries are not
+# reachable. A clean CI/release build continues to use the main Dockerfile.
+WORKDIR /app
+COPY app ./app
+COPY alembic ./alembic
+COPY scripts ./scripts
+COPY tests ./tests
+COPY alembic.ini requirements.txt ./
+
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]

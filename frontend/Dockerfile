@@ -1,0 +1,24 @@
+ARG NODE_IMAGE=node:22.23.2-alpine
+ARG NGINX_IMAGE=nginx:1.31.4-alpine
+
+FROM ${NODE_IMAGE} AS build
+
+WORKDIR /app
+
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm config set registry https://registry.npmmirror.com \
+    && pnpm config set fetch-timeout 600000 \
+    && pnpm config set fetch-retries 5 \
+    && pnpm config set network-concurrency 4 \
+    && pnpm install --frozen-lockfile
+
+COPY . .
+RUN pnpm run build
+
+FROM ${NGINX_IMAGE}
+
+COPY nginx.conf /etc/nginx/templates/default.conf.template
+COPY --from=build /app/dist /usr/share/nginx/html
+
+EXPOSE 80

@@ -1,1 +1,1 @@
-"""Smart review backend package."""
+# SmartReview API

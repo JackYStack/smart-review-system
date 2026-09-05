@@ -1,44 +1,14 @@
-# Python
+.env
+.env.docker
+.env.local
+*.pyc
 __pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
 .venv/
 venv/
-.env
-.env.*
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-htmlcov/
-*.log
-
-# Node
 node_modules/
-frontend/dist/
-frontend/.vite/
-frontend/*.tsbuildinfo
-
-# IDE
+dist/
 .idea/
 .vscode/
-*.swp
-
-# Data in code repository
-*.pdf
-*.docx
-*.xlsx
-!backend/tests/fixtures/*.json
-
-# Docker
-.docker/
-
-# Model weights
-*.bin
-*.safetensors
-*.gguf
-
-# OS
-.DS_Store
-Thumbs.db
+*.log
+backups/
+deploy/certs/*.pem

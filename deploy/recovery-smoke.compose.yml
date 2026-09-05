@@ -1,0 +1,16 @@
+# Disposable recovery-drill overlay. It publishes no ports and makes the API
+# use the isolated MinIO service directly. Always combine it with a unique `-p`
+# project name and remove that project with `down -v` after verification.
+services:
+  backend:
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_SECURE: "false"
+
+  worker:
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_SECURE: "false"
+
+  frontend:
+    ports: !reset []

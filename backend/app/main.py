@@ -1,34 +1,103 @@
+from contextlib import asynccontextmanager
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
-from app.api.v1 import expert, kb, parse, report, review
+from app.api import (
+    admin_dashboard,
+    auth,
+    basis,
+    expert_reviews,
+    health,
+    onlyoffice_callback,
+    projects,
+    rules,
+    review_tasks,
+    settings_dashboard,
+    settings_integrations,
+    settings_diagnostics,
+    settings_review,
+    scheme_types,
+    scheme_workflow_profiles,
+    settings_kb,
+    settings_model,
+    settings_onlyoffice,
+    templates,
+    users,
+)
 from app.config import get_settings
+from app.database import SessionLocal
+from app.models.user import User, UserRole
+from app.core.security import hash_password
+from app.services.dashboard_scheduler import run_dashboard_snapshot_scheduler
+from app.services.secret_store import encrypt_legacy_database_secrets
+
+
+def bootstrap_admin() -> None:
+    settings = get_settings()
+    if not settings.admin_bootstrap or not settings.admin_username or not settings.admin_password:
+        return
+    db: Session = SessionLocal()
+    try:
+        exists = db.query(User).filter(User.username == settings.admin_username).first()
+        if exists:
+            return
+        user = User(
+            username=settings.admin_username,
+            phone=settings.admin_phone or "00000000000",
+            password_hash=hash_password(settings.admin_password),
+            role=UserRole.admin,
+        )
+        db.add(user)
+        db.commit()
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    bootstrap_admin()
+    with SessionLocal() as db:
+        encrypt_legacy_database_secrets(db)
+    stop_event = asyncio.Event()
+    scheduler_task = asyncio.create_task(run_dashboard_snapshot_scheduler(stop_event))
+    yield
+    stop_event.set()
+    await scheduler_task
 
 
 def create_app() -> FastAPI:
-    """Create the FastAPI application."""
-
     settings = get_settings()
-    app = FastAPI(title=settings.app_name, version="0.1.0", debug=settings.debug)
-
+    app = FastAPI(title="SmartReview API", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origins=settings.cors_origins_list,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    app.include_router(parse.router, prefix=f"{settings.api_v1_prefix}/parse", tags=["parse"])
-    app.include_router(review.router, prefix=f"{settings.api_v1_prefix}/review", tags=["review"])
-    app.include_router(kb.router, prefix=f"{settings.api_v1_prefix}/kb", tags=["knowledge-base"])
-    app.include_router(expert.router, prefix=f"{settings.api_v1_prefix}/expert", tags=["expert"])
-    app.include_router(report.router, prefix=f"{settings.api_v1_prefix}/report", tags=["report"])
-
-    @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "service": "smart-review-backend"}
-
+    app.include_router(auth.router)
+    app.include_router(health.router)
+    app.include_router(admin_dashboard.router)
+    app.include_router(users.router)
+    app.include_router(scheme_types.router)
+    app.include_router(scheme_workflow_profiles.router)
+    app.include_router(basis.router)
+    app.include_router(projects.router)
+    app.include_router(templates.router)
+    app.include_router(review_tasks.router)
+    app.include_router(expert_reviews.router)
+    app.include_router(rules.router)
+    app.include_router(settings_kb.router)
+    app.include_router(settings_dashboard.router)
+    app.include_router(settings_integrations.router)
+    app.include_router(settings_diagnostics.router)
+    app.include_router(settings_review.router)
+    app.include_router(settings_onlyoffice.router)
+    app.include_router(settings_model.router)
+    app.include_router(onlyoffice_callback.router)
     return app
 
 

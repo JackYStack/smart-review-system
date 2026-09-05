@@ -1,0 +1,111 @@
+{
+  "format": "smartreview-demo-config/v1",
+  "description": "前端离线演示的可重复业务配置，与 frontend/src/demo/demoApi.ts 对应",
+  "scheme_types": [
+    {
+      "id": 1,
+      "category": "脚手架工程",
+      "name": "落地式钢管脚手架专项施工方案",
+      "lifecycle_status": "published",
+      "template_configured": true,
+      "workflow_configured": true
+    },
+    {
+      "id": 2,
+      "category": "模板工程及支撑体系",
+      "name": "高大模板专项施工方案",
+      "lifecycle_status": "published",
+      "template_configured": true,
+      "workflow_configured": true
+    }
+  ],
+  "projects": [
+    {
+      "id": 1,
+      "name": "城市更新脚手架工程（演示）",
+      "region": "北京市海淀区",
+      "construction_unit": "演示建设单位",
+      "contractor": "演示施工单位",
+      "supervision_unit": "演示监理单位"
+    }
+  ],
+  "basis": [
+    {
+      "doc_type": "国家标准",
+      "standard_no": "JGJ 130-2011",
+      "doc_name": "建筑施工扣件式钢管脚手架安全技术规范",
+      "effect_status": "现行",
+      "is_mandatory": true,
+      "remark": "离线演示依据；正式项目需由法规组核验版本和效力"
+    }
+  ],
+  "rules": [
+    {
+      "rule_code": "SCAFFOLD-STRUCT-001",
+      "scheme_type_id": 1,
+      "rule_type": "required_section",
+      "severity": "error",
+      "config": { "keywords": ["施工监测", "监测预警"], "match": "all" },
+      "evidence": { "standard_no": "JGJ 130-2011", "clause": "8.2.3" }
+    },
+    {
+      "rule_code": "SCAFFOLD-HEIGHT-001",
+      "scheme_type_id": 1,
+      "rule_type": "parameter_range",
+      "severity": "warning",
+      "config": { "parameter": "scaffold_height", "min": 0, "max": 50, "unit": "m" },
+      "evidence": { "standard_no": "JGJ 130-2011", "clause": "1.0.2" }
+    },
+    {
+      "rule_code": "SCAFFOLD-LOAD-001",
+      "scheme_type_id": 1,
+      "rule_type": "formula",
+      "severity": "error",
+      "config": {},
+      "evidence": { "standard_no": "JGJ 130-2011", "clause": "5.2.1" }
+    }
+  ],
+  "formulas": [
+    {
+      "rule_code": "SCAFFOLD-LOAD-001",
+      "formula_code": "SCAFFOLD-LOAD-CHECK-001",
+      "name": "荷载效应与承载力比值",
+      "expression": "design_load / capacity",
+      "variables": {
+        "design_load": { "parameter": "design_load", "unit": "kN" },
+        "capacity": { "parameter": "member_capacity", "unit": "kN" }
+      },
+      "comparator": "<=",
+      "threshold_value": 1
+    }
+  ],
+  "workflow": {
+    "steps": ["start", "structure", "compilation_basis", "context_consistency", "content", "full_document", "end"],
+    "full_document_prompt": "通篇检查章节完整性、关键参数一致性、危险源控制、验收、监测、应急和法规依据。"
+  },
+  "dify_contract": {
+    "output_variable": "report",
+    "output_format": "json",
+    "input_variables": ["documents", "site_images", "project_name", "project_region", "risk_type", "review_focus"]
+  },
+  "settings_example": {
+    "paddleocr_api_url": "http://paddleocr:8866",
+    "workflow_output_variable": "report",
+    "workflow_output_format": "json",
+    "workflow_timeout_seconds": 900,
+    "onlyoffice_docs_url": "http://onlyoffice"
+  },
+  "expert_review_example": {
+    "round_status": "pending",
+    "actions": ["claim", "issue_decision", "request_changes", "approve", "sign"],
+    "issue_count": 3,
+    "evidence_policy": "没有可追溯法规来源的问题必须标记为疑似问题并由专家判断"
+  },
+  "complete_importable_config": "../完整系统范例/可导入配置",
+  "full_mysql_minio_backup": "../完整系统范例/完整数据备份/smartreview-backup-final",
+  "sample_files": [
+    "完整系统范例/输入输出样例/脚手架专项施工方案_缺陷演示样本.docx",
+    "完整系统范例/输入输出样例/任务12_AI批注方案.docx",
+    "完整系统范例/输入输出样例/任务12_智能审查报告.docx"
+  ]
+}

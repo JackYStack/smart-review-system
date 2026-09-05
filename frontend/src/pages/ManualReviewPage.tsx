@@ -1,0 +1,1196 @@
+import {
+  ArrowDownOutlined,
+  DownloadOutlined,
+  EditOutlined,
+  EyeOutlined,
+  RollbackOutlined,
+} from '@ant-design/icons'
+import {
+  App as AntApp,
+  Alert,
+  Button,
+  Card,
+  Collapse,
+  Empty,
+  List,
+  Space,
+  Spin,
+  Table,
+  Tag,
+  Typography,
+} from 'antd'
+import { useQuery } from '@tanstack/react-query'
+import { useMemo, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
+import { api } from '../api/client'
+import type { ReportIssue, ReportStep, ReviewReportV1, ReviewSettings, ReviewTask } from '../api/types'
+import { useAuth } from '../auth/AuthContext'
+import StructureReviewDetail from '../components/StructureReviewDetail'
+import { formatApiErrorMessage } from '../utils/apiError'
+import { buildReviewExportFilename } from '../utils/reviewExportFilename'
+import { relatedMetadataText, REVIEW_STEP_LABELS } from '../utils/reviewDisplay'
+
+const STEP_LABELS = REVIEW_STEP_LABELS
+
+const SEVERITY_META: Record<string, { label: string; color: string }> = {
+  error: { label: '严重', color: 'red' },
+  warning: { label: '警告', color: 'gold' },
+  info: { label: '提示', color: 'blue' },
+}
+
+function normalizedStatus(value?: string | null): string {
+  return String(value ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+}
+
+function reviewConclusionMeta(value?: string | null): { label: string; color: string } {
+  const status = normalizedStatus(value)
+  if (['passed', 'compliant', 'no_issues', '通过', '合规'].includes(status)) {
+    return { label: '审查通过', color: 'success' }
+  }
+  if (
+    ['issues_found', 'non_compliant', 'noncompliant', 'failed', '发现问题', '不合规'].includes(
+      status,
+    )
+  ) {
+    return { label: '发现问题', color: 'error' }
+  }
+  if (['not_reviewed', 'unavailable', '未审查', '未形成结论'].includes(status)) {
+    return { label: '未形成结论', color: 'default' }
+  }
+  return { label: value?.trim() || '未记录审查结论', color: 'default' }
+}
+
+function completenessMeta(value?: string | null): { label: string; color: string; degraded: boolean } {
+  const status = normalizedStatus(value)
+  if (['complete', 'full', '完整'].includes(status)) {
+    return { label: '结果完整', color: 'success', degraded: false }
+  }
+  if (['partial', 'degraded', 'incomplete', '部分', '降级'].includes(status)) {
+    return { label: '降级/部分结果', color: 'warning', degraded: true }
+  }
+  if (['unavailable', 'none', 'missing', '不可用', '无结果'].includes(status)) {
+    return { label: '结果不可用', color: 'error', degraded: true }
+  }
+  return { label: value?.trim() || '未记录完整性', color: 'default', degraded: false }
+}
+
+function humanStatusMeta(value?: string | null): { label: string; color: string } {
+  const status = normalizedStatus(value)
+  if (['pending', 'awaiting_review', 'not_started', '待复核', '待人工复核'].includes(status)) {
+    return { label: '待人工复核', color: 'processing' }
+  }
+  if (['in_review', 'reviewing', '复核中'].includes(status)) {
+    return { label: '人工复核中', color: 'warning' }
+  }
+  if (['approved', 'confirmed', 'completed', '已确认', '已通过'].includes(status)) {
+    return { label: '人工已确认', color: 'success' }
+  }
+  if (['changes_requested', 'rejected', '待整改', '退回整改'].includes(status)) {
+    return { label: '待整改', color: 'error' }
+  }
+  if (['not_required', '无需复核'].includes(status)) {
+    return { label: '无需复核', color: 'default' }
+  }
+  return { label: value?.trim() || '未记录人工状态', color: 'default' }
+}
+
+const MODERN_TABLE_HEADER_STYLE = {
+  background: '#F8FAFC',
+  color: '#1E293B',
+  fontWeight: 700,
+  fontFamily:
+    'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif',
+}
+
+const MODERN_TABLE_CELL_STYLE = {
+  padding: '14px 16px',
+  borderBottom: '1px solid #F1F5F9',
+  fontFamily:
+    'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif',
+}
+
+const BASIS_CATEGORY_TAG_STYLES: Record<string, { bg: string; text: string; label: string }> = {
+  现行缺失: { bg: '#FEE2E2', text: '#991B1B', label: '现行缺失' },
+  废止误引: { bg: '#FEF3C7', text: '#92400E', label: '废止误引' },
+}
+
+function asStringArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return []
+  return v.map((x) => String(x ?? '').trim()).filter(Boolean)
+}
+
+/** Parse title_path from array or "A > B" string (full-document / legacy issues). */
+function parseTitlePathValue(v: unknown): string[] {
+  if (Array.isArray(v)) return asStringArray(v)
+  if (typeof v === 'string' && v.trim()) {
+    return v
+      .split(/\s*[>＞]\s*/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+  }
+  return []
+}
+
+function extractStandardsText(text: string): string[] {
+  if (!text.trim()) return []
+  const regex =
+    /\b(?:GB|JGJ|DBJ|DB|CECS|T\/[A-Z]+)\s*[-/]?\s*\d{2,6}(?:\.\d+)?(?:-\d{4})?\b/gi
+  const hits = text.match(regex) ?? []
+  return Array.from(new Set(hits.map((x) => x.replace(/\s+/g, ' ').trim())))
+}
+
+function extractAiSuggestions(related: Record<string, unknown> | undefined): string[] {
+  if (!related) return []
+  const out: string[] = []
+  const pushText = (v: unknown) => {
+    const s = String(v ?? '').trim()
+    if (s) out.push(s)
+  }
+  const arr = related.suggestions
+  if (Array.isArray(arr)) {
+    arr.forEach((x) => pushText(x))
+  }
+  pushText(related.suggestion)
+  pushText(related.optimize_suggestion)
+  pushText(related.optimization_suggestion)
+  return Array.from(new Set(out))
+}
+
+function getIssueOriginalText(issue: ReportIssue): string {
+  const related = issue.related
+  const normalized = String(related?.original_text ?? '').trim()
+  if (normalized) return normalized
+  return String(issue.evidence ?? '').trim()
+}
+
+/** 上下文一致性：章节 / 对照章节（优先完整 title_path，如「一、… > 1.…」） */
+function getContextConsistencyChapterPair(issue: ReportIssue): {
+  chapter: string
+  compareChapter: string
+} {
+  const related = issue.related ?? {}
+  const chapterFromPath = asStringArray(issue.anchor?.title_path).join(' > ').trim()
+  const rawA = String(
+    (related as Record<string, unknown>).chapter_a ??
+      (related as Record<string, unknown>).current_chapter ??
+      '',
+  ).trim()
+  const pathB = asStringArray((related as Record<string, unknown>).chapter_b_path)
+  const rawB = String(
+    (related as Record<string, unknown>).chapter_b ??
+      (related as Record<string, unknown>).ref_chapter ??
+      (related as Record<string, unknown>).compare_chapter ??
+      '',
+  ).trim()
+  const compareChapter = (pathB.length ? pathB.join(' > ') : rawB) || '—'
+  return {
+    chapter: chapterFromPath || rawA || '—',
+    compareChapter,
+  }
+}
+
+function getIssueLocation(issue: ReportIssue): {
+  chapterText: string
+  templateNodeId: string
+  headingParaIndex: string
+  userTitle: string
+} {
+  const related = issue.related
+  const locationRaw = related?.location
+  const location =
+    typeof locationRaw === 'object' && locationRaw && !Array.isArray(locationRaw)
+      ? locationRaw
+      : undefined
+  const chapterPathFromLocString =
+    typeof locationRaw === 'string' ? parseTitlePathValue(locationRaw) : []
+  const chapterPathFromLoc = parseTitlePathValue(
+    (location as Record<string, unknown> | undefined)?.chapter_path,
+  )
+  const chapterPathFromAnchor = parseTitlePathValue(issue.anchor?.title_path)
+  const chapterPath =
+    chapterPathFromLoc.length > 0
+      ? chapterPathFromLoc
+      : chapterPathFromLocString.length > 0
+        ? chapterPathFromLocString
+        : chapterPathFromAnchor
+  const chapterText = String((location as Record<string, unknown> | undefined)?.chapter_text ?? '').trim()
+  const relatedChapter = parseTitlePathValue(related?.chapter)
+  const relatedChapterText =
+    typeof related?.chapter_text === 'string' ? String(related.chapter_text).trim() : ''
+  const relatedChapterA =
+    typeof related?.chapter_a === 'string' ? String(related.chapter_a).trim() : ''
+  const evidencePath = parseTitlePathValue(getIssueOriginalText(issue))
+  const messagePath = (() => {
+    const msg = String(issue.message ?? '')
+    for (const line of msg.split('\n')) {
+      if (/\s*[>＞]\s*/.test(line)) {
+        const p = parseTitlePathValue(line)
+        if (p.length) return p
+      }
+    }
+    return [] as string[]
+  })()
+  const templateNodeId = String(
+    (location as Record<string, unknown> | undefined)?.template_node_id ??
+      issue.anchor?.template_node_id ??
+      '',
+  ).trim()
+  const headingParaIndex = String(
+    (location as Record<string, unknown> | undefined)?.heading_para_index ??
+      issue.anchor?.heading_para_index ??
+      '',
+  ).trim()
+  const userTitle = String(
+    (location as Record<string, unknown> | undefined)?.user_title ?? issue.anchor?.user_title ?? '',
+  ).trim()
+  const chapterDisplay =
+    chapterText ||
+    chapterPath.join(' > ') ||
+    relatedChapterText ||
+    relatedChapterA ||
+    relatedChapter.join(' > ') ||
+    evidencePath.join(' > ') ||
+    messagePath.join(' > ')
+
+  return {
+    chapterText: chapterDisplay,
+    templateNodeId,
+    headingParaIndex,
+    userTitle,
+  }
+}
+
+function getBasisIssueCategory(issue: ReportIssue): string {
+  const related = issue.related ?? {}
+  const rawCategory = String((related as Record<string, unknown>).category ?? '').trim()
+  if (rawCategory === '现行缺失' || rawCategory === '废止误引') return rawCategory
+  const message = String(issue.message ?? '').trim()
+  if (message.includes('废止') || message.includes('失效')) return '废止误引'
+  return '现行缺失'
+}
+
+function parseReport(json: string | null | undefined): ReviewReportV1 | null {
+  if (!json?.trim()) return null
+  try {
+    const o = JSON.parse(json) as ReviewReportV1
+    if (!o || !Array.isArray(o.steps)) return null
+    return o
+  } catch {
+    return null
+  }
+}
+
+async function downloadWordV2(taskId: number, downloadName: string): Promise<void> {
+  const { data } = await api.get<{ url: string }>(
+    `/review-tasks/${taskId}/output-download-url`,
+  )
+  const res = await fetch(data.url)
+  if (!res.ok) throw new Error('下载失败')
+  const blob = await res.blob()
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = downloadName
+  a.rel = 'noopener'
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+export default function ManualReviewPage() {
+  const { taskId } = useParams<{ taskId: string }>()
+  const id = Number(taskId)
+  const navigate = useNavigate()
+  const { message } = AntApp.useApp()
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
+  const [selectedIdx, setSelectedIdx] = useState(0)
+
+  const {
+    data: task,
+    isLoading,
+    isError,
+    error: taskError,
+    refetch: refetchTask,
+    isFetching,
+  } = useQuery({
+    queryKey: ['review-task', id],
+    queryFn: async () => {
+      const { data } = await api.get<ReviewTask>(`/review-tasks/${id}`)
+      return data
+    },
+    enabled: Number.isFinite(id) && id > 0,
+    refetchInterval: (q) =>
+      q.state.data?.status === 'pending' || q.state.data?.status === 'processing'
+        ? 3000
+        : false,
+  })
+  const { data: reviewSettings } = useQuery({
+    queryKey: ['settings', 'review'],
+    queryFn: async () => {
+      const { data } = await api.get<ReviewSettings>('/settings/review')
+      return data
+    },
+    enabled: isAdmin,
+    retry: false,
+  })
+
+  const report = useMemo(() => parseReport(task?.review_result_json), [task])
+
+  const steps: ReportStep[] = report?.steps ?? []
+
+  const canExport = Boolean(task?.output_object_key?.trim())
+  const handleExport = async () => {
+    if (!task) return
+    if (!canExport) {
+      message.warning('该任务未生成带批注的审核方案，不能以原始文件代替审核结果')
+      return
+    }
+    try {
+      const name = buildReviewExportFilename(task.original_filename)
+      await downloadWordV2(task.id, name)
+      message.success(`已开始下载 ${name}`)
+    } catch {
+      message.error('导出失败（可能尚无批注文档）')
+    }
+  }
+
+  if (!Number.isFinite(id) || id <= 0) {
+    return (
+      <Typography.Text type="danger">无效的任务 ID</Typography.Text>
+    )
+  }
+
+  if (isLoading) {
+    return (
+      <div
+        style={{
+          height: '100%',
+          minHeight: 0,
+          flex: 1,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#fff',
+        }}
+      >
+        <Spin />
+      </div>
+    )
+  }
+
+  if (isError || !task) {
+    return (
+      <div style={{ height: '100%', padding: 24, background: '#fff' }}>
+        <Alert
+          type="error"
+          showIcon
+          message="无法加载审核任务"
+          description={formatApiErrorMessage(
+            taskError,
+            task ? '任务数据不完整，请稍后重试。' : '任务不存在、已删除，或当前账号无权访问。',
+          )}
+          action={
+            <Space>
+              <Button size="small" onClick={() => navigate('/review')}>返回列表</Button>
+              <Button
+                size="small"
+                type="primary"
+                loading={isFetching}
+                onClick={() => void refetchTask()}
+              >
+                重试
+              </Button>
+            </Space>
+          }
+        />
+      </div>
+    )
+  }
+
+  const activeStep = steps[Math.min(selectedIdx, Math.max(0, steps.length - 1))]
+  const activeDebugPrompts =
+    task.debug_prompts?.filter((p) => p.step_id === activeStep?.step_id) ?? []
+  const conclusionView = reviewConclusionMeta(task.review_conclusion)
+  const completenessView = completenessMeta(task.completeness_status)
+  const humanView = humanStatusMeta(task.human_status)
+  const technicalLabel =
+    task.status === 'pending'
+      ? '技术状态：排队中'
+      : task.status === 'processing'
+        ? '技术状态：处理中'
+        : task.status === 'succeeded'
+          ? '技术状态：执行完成'
+          : '技术状态：执行失败'
+
+  return (
+    <div
+      style={{
+        height: '100%',
+        minHeight: 0,
+        flex: 1,
+        display: 'flex',
+        flexDirection: 'column',
+        overflow: 'hidden',
+        background: '#fff',
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexShrink: 0,
+          flexWrap: 'wrap',
+          gap: 12,
+          padding: '10px 16px',
+          borderBottom: '1px solid #f0f0f0',
+        }}
+      >
+        <Space align="start" size={12} wrap>
+          <Button icon={<RollbackOutlined />} onClick={() => navigate('/review')}>
+            返回
+          </Button>
+          <div style={{ minWidth: 0 }}>
+            <Typography.Title level={4} style={{ margin: 0 }}>
+              {activeStep?.step_id === 'structure'
+                ? `人工审阅 · ${STEP_LABELS.structure}`
+                : `人工审阅 — 任务 #${task.id}`}
+            </Typography.Title>
+            <Typography.Text
+              type="secondary"
+              style={{ display: 'block', fontSize: 13, marginTop: 2 }}
+            >
+              方案审核 / {task.original_filename?.trim() || '未命名文档'} /{' '}
+              {activeStep
+                ? STEP_LABELS[activeStep.step_id] ?? activeStep.step_id
+                : '—'}
+            </Typography.Text>
+            <Typography.Text type="secondary" style={{ fontSize: 13 }}>
+              {activeStep?.step_id === 'structure'
+                ? `任务 #${task.id} · ${task.scheme_category} / ${task.scheme_name}`
+                : `${task.scheme_category} / ${task.scheme_name}`}
+            </Typography.Text>
+            <Space wrap size={[6, 6]} style={{ marginTop: 6 }}>
+              <Tag color={task.status === 'failed' ? 'error' : task.status === 'succeeded' ? 'success' : 'processing'}>
+                {technicalLabel}
+              </Tag>
+              <Tag color={conclusionView.color}>审查结论：{conclusionView.label}</Tag>
+              <Tag color={completenessView.color}>完整性：{completenessView.label}</Tag>
+              <Tag color={humanView.color}>人工状态：{humanView.label}</Tag>
+            </Space>
+          </div>
+        </Space>
+        <Space>
+          <Button
+            icon={<EyeOutlined />}
+            disabled={!canExport}
+            onClick={() => navigate(`/review/${task.id}/preview`)}
+          >
+            预览
+          </Button>
+          <Button
+            icon={<EditOutlined />}
+            disabled={!canExport}
+            onClick={() => navigate(`/review/${task.id}/edit`)}
+          >
+            编辑
+          </Button>
+          <Button
+            type="primary"
+            icon={<DownloadOutlined />}
+            disabled={!canExport}
+            onClick={() => void handleExport()}
+          >
+            导出 Word
+          </Button>
+        </Space>
+      </div>
+
+      {completenessView.degraded ? (
+        <Alert
+          type={normalizedStatus(task.completeness_status) === 'unavailable' ? 'error' : 'warning'}
+          showIcon
+          banner
+          message={
+            normalizedStatus(task.completeness_status) === 'unavailable'
+              ? '本任务未形成可用的完整审查结果，以下内容不得作为最终审查结论。'
+              : '本任务为降级或部分完成结果，可能存在未执行步骤、外部服务异常或证据缺失，必须人工复核。'
+          }
+        />
+      ) : null}
+
+      <div style={{ display: 'flex', gap: 0, flex: 1, minHeight: 0 }}>
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            flexShrink: 0,
+            padding: '12px 10px 12px 12px',
+            borderRight: '1px solid #f0f0f0',
+          }}
+        >
+          {steps.length === 0 ? (
+            <Empty description="暂无审核步骤数据" />
+          ) : (
+            steps.map((s, i) => (
+              <div
+                key={`${s.step_id}-${i}`}
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                }}
+              >
+                <Button
+                  type="default"
+                  shape="circle"
+                  size="large"
+                  onClick={() => setSelectedIdx(i)}
+                  style={{
+                    width: 48,
+                    height: 48,
+                    borderColor: s.passed ? '#52c41a' : '#ff4d4f',
+                    color: s.passed ? '#52c41a' : '#ff4d4f',
+                    fontWeight: 600,
+                    background: selectedIdx === i ? 'rgba(22, 119, 255, 0.08)' : undefined,
+                  }}
+                >
+                  {i + 1}
+                </Button>
+                <Typography.Text
+                  style={{
+                    marginTop: 6,
+                    fontSize: 12,
+                    maxWidth: 88,
+                    textAlign: 'center',
+                  }}
+                >
+                  {STEP_LABELS[s.step_id] ?? s.step_id}
+                </Typography.Text>
+                {i < steps.length - 1 && (
+                  <ArrowDownOutlined
+                    style={{ margin: '8px 0', color: 'rgba(0,0,0,0.35)' }}
+                  />
+                )}
+              </div>
+            ))
+          )}
+        </div>
+
+        <Card
+          style={{
+            flex: 1,
+            minWidth: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            borderRadius: 0,
+            border: 'none',
+            boxShadow: 'none',
+          }}
+          styles={{ body: { flex: 1, overflow: 'auto', padding: 16 } }}
+          title="审核详情"
+        >
+          {task.error_message && task.status === 'failed' ? (
+            <Typography.Paragraph type="danger" style={{ marginBottom: 16 }}>
+              {task.error_message}
+            </Typography.Paragraph>
+          ) : null}
+          {!activeStep ? (
+            <Typography.Paragraph type="secondary">
+              等待任务完成或报告生成…
+            </Typography.Paragraph>
+          ) : activeStep.step_id === 'structure' ? (
+            <StructureReviewDetail
+              task={task}
+              step={activeStep}
+              onNavigateEdit={() => navigate(`/review/${task.id}/edit`)}
+            />
+          ) : (
+            <>
+              <Space style={{ marginBottom: 12 }}>
+                <Tag color={activeStep.passed ? 'success' : 'error'}>
+                  {activeStep.passed ? '通过' : '有问题'}
+                </Tag>
+                <Typography.Text
+                  type="secondary"
+                  style={activeStep.step_id === 'dify_workflow' ? { whiteSpace: 'pre-wrap' } : undefined}
+                >
+                  {activeStep.summary}
+                </Typography.Text>
+              </Space>
+              {isAdmin && reviewSettings?.prompt_debug_enabled ? (
+                <>
+                  <Typography.Title level={5}>拼接提示词（调试）</Typography.Title>
+                  {activeDebugPrompts.length === 0 ? (
+                    <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
+                      未开启调试开关，或该任务在开启前执行，暂无可展示提示词。
+                    </Typography.Text>
+                  ) : (
+                    <Collapse
+                      style={{ marginBottom: 16 }}
+                      items={activeDebugPrompts.map((item, idx) => ({
+                        key: `${item.step_id}-${item.template_node_id}-${idx}`,
+                        label: item.template_node_id
+                          ? `节点 ${item.template_node_id} · ${item.prompt_length} 字符`
+                          : `提示词 #${idx + 1} · ${item.prompt_length} 字符`,
+                        children: (
+                          <pre
+                            style={{
+                              margin: 0,
+                              whiteSpace: 'pre-wrap',
+                              fontSize: 12,
+                              background: 'var(--ant-color-fill-quaternary)',
+                              padding: 8,
+                              borderRadius: 6,
+                            }}
+                          >
+                            {item.prompt_text}
+                          </pre>
+                        ),
+                      }))}
+                    />
+                  )}
+                </>
+              ) : null}
+              <Typography.Title level={5}>问题列表</Typography.Title>
+              {activeStep.issues.length === 0 ? (
+                <Typography.Text type="secondary">本步骤无问题项</Typography.Text>
+              ) : activeStep.step_id === 'compilation_basis' ? (
+                <>
+                  <style>
+                    {`
+                      .basis-review-table .ant-table-thead > tr > th {
+                        background: #F8FAFC !important;
+                        color: #1E293B !important;
+                        font-weight: 700 !important;
+                        border-bottom: 1px solid #F1F5F9 !important;
+                      }
+                      .basis-review-table .ant-table-tbody > tr > td {
+                        border-bottom: 1px solid #F1F5F9 !important;
+                      }
+                      .basis-review-table .ant-table-tbody > tr:hover > td {
+                        background: #F1F5F9 !important;
+                      }
+                    `}
+                  </style>
+                  <Table<ReportIssue>
+                    className="basis-review-table"
+                    style={{
+                      fontFamily:
+                        'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif',
+                    }}
+                    rowKey={(it, idx) => it.issue_id || `${it.message}-${idx}`}
+                    pagination={false}
+                    size="small"
+                    scroll={{ x: 1100 }}
+                    dataSource={activeStep.issues}
+                    columns={[
+                      {
+                        title: '问题',
+                        dataIndex: 'message',
+                        width: 260,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (v: string) => (
+                          <Typography.Text style={{ color: '#0F172A', lineHeight: 1.7 }}>
+                            {v || '-'}
+                          </Typography.Text>
+                        ),
+                      },
+                      {
+                        title: '原文',
+                        width: 420,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (_, it) => {
+                          const originalText = getIssueOriginalText(it)
+                          const location = getIssueLocation(it)
+                          return (
+                            <Space direction="vertical" size={8} style={{ width: '100%', maxWidth: 420 }}>
+                              <Typography.Text strong style={{ color: '#0F172A' }}>
+                                {location.chapterText || '未定位到明确章节'}
+                              </Typography.Text>
+                              {location.userTitle ? (
+                                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                  文档标题：{location.userTitle}
+                                </Typography.Text>
+                              ) : null}
+                              {originalText ? (
+                                <Typography.Text
+                                  style={{
+                                    color: '#64748B',
+                                    lineHeight: 1.75,
+                                    whiteSpace: 'normal',
+                                    wordBreak: 'break-word',
+                                  }}
+                                >
+                                  {originalText}
+                                </Typography.Text>
+                              ) : (
+                                <Tag color="warning">缺少原文证据，必须人工核验</Tag>
+                              )}
+                            </Space>
+                          )
+                        },
+                      },
+                      {
+                        title: '修改建议',
+                        width: 270,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (_, it) => {
+                          const suggestions = extractAiSuggestions(it.related)
+                          return suggestions.length > 0 ? (
+                            <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.8, color: '#334155' }}>
+                              {suggestions.map((s, idx) => (
+                                <li key={`${it.issue_id || it.message}-t-${idx}`}>{s}</li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <Typography.Text type="secondary">模型未返回整改建议</Typography.Text>
+                          )
+                        },
+                      },
+                      {
+                        title: '类别',
+                        width: 120,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (_, it) => {
+                          const category = getBasisIssueCategory(it)
+                          const style = BASIS_CATEGORY_TAG_STYLES[category] ?? {
+                            bg: '#E2E8F0',
+                            text: '#334155',
+                            label: category || '-',
+                          }
+                          return (
+                            <Tag
+                              style={{
+                                background: style.bg,
+                                color: style.text,
+                                border: 'none',
+                                borderRadius: 6,
+                                padding: '2px 10px',
+                                fontWeight: 600,
+                              }}
+                            >
+                              {style.label}
+                            </Tag>
+                          )
+                        },
+                      },
+                    ]}
+                  />
+                </>
+              ) : activeStep.step_id === 'context_consistency' ? (
+                <>
+                  <style>
+                    {`
+                      .context-consistency-review-table .ant-table-thead > tr > th {
+                        background: #F8FAFC !important;
+                        color: #1E293B !important;
+                        font-weight: 700 !important;
+                        border-bottom: 1px solid #F1F5F9 !important;
+                      }
+                      .context-consistency-review-table .ant-table-tbody > tr > td {
+                        border-bottom: 1px solid #F1F5F9 !important;
+                      }
+                      .context-consistency-review-table .ant-table-tbody > tr:hover > td {
+                        background: #F1F5F9 !important;
+                      }
+                    `}
+                  </style>
+                  <Table<ReportIssue>
+                    className="context-consistency-review-table"
+                    style={{
+                      fontFamily:
+                        'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif',
+                    }}
+                    rowKey={(it, idx) => it.issue_id || `${it.message}-${idx}`}
+                    pagination={false}
+                    size="small"
+                    scroll={{ x: 1020 }}
+                    dataSource={activeStep.issues}
+                    columns={[
+                      {
+                        title: '章节',
+                        width: 200,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (_, it) => {
+                          const { chapter } = getContextConsistencyChapterPair(it)
+                          return chapter === '—' ? (
+                            <Tag color="warning">未定位当前章节</Tag>
+                          ) : (
+                            <Typography.Text style={{ color: '#0F172A', lineHeight: 1.7 }}>
+                              {chapter}
+                            </Typography.Text>
+                          )
+                        },
+                      },
+                      {
+                        title: '对比章节',
+                        width: 200,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (_, it) => {
+                          const { compareChapter } = getContextConsistencyChapterPair(it)
+                          return compareChapter === '—' ? (
+                            <Tag color="warning">未定位对比章节</Tag>
+                          ) : (
+                            <Typography.Text style={{ color: '#0F172A', lineHeight: 1.7 }}>
+                              {compareChapter}
+                            </Typography.Text>
+                          )
+                        },
+                      },
+                      {
+                        title: '问题',
+                        dataIndex: 'message',
+                        width: 300,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (v: string, it) => (
+                          <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                            <Typography.Text style={{ color: '#0F172A', lineHeight: 1.7 }}>
+                              {v?.trim() || '—'}
+                            </Typography.Text>
+                            {it.evidence?.trim() ? (
+                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                证据：{it.evidence}
+                              </Typography.Text>
+                            ) : (
+                              <Tag color="warning" style={{ width: 'fit-content' }}>
+                                缺少证据，必须人工核验
+                              </Tag>
+                            )}
+                          </Space>
+                        ),
+                      },
+                      {
+                        title: '优化建议',
+                        width: 280,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (_, it) => {
+                          const suggestions = extractAiSuggestions(it.related)
+                          return suggestions.length > 0 ? (
+                            <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.8, color: '#334155' }}>
+                              {suggestions.map((s, idx) => (
+                                <li key={`${it.issue_id || it.message}-ctx-${idx}`}>{s}</li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <Typography.Text type="secondary">模型未返回整改建议</Typography.Text>
+                          )
+                        },
+                      },
+                    ]}
+                  />
+                </>
+              ) : activeStep.step_id === 'content' || activeStep.step_id === 'full_document' ? (
+                <>
+                  <style>
+                    {`
+                      .content-review-table .ant-table-thead > tr > th {
+                        background: #F8FAFC !important;
+                        color: #1E293B !important;
+                        font-weight: 700 !important;
+                        border-bottom: 1px solid #F1F5F9 !important;
+                      }
+                      .content-review-table .ant-table-tbody > tr > td {
+                        border-bottom: 1px solid #F1F5F9 !important;
+                      }
+                      .content-review-table .ant-table-tbody > tr:hover > td {
+                        background: #F1F5F9 !important;
+                      }
+                    `}
+                  </style>
+                  <Table<ReportIssue>
+                    className="content-review-table"
+                    style={{
+                      fontFamily:
+                        'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif',
+                    }}
+                    rowKey={(it, idx) => it.issue_id || `${it.message}-${idx}`}
+                    pagination={false}
+                    size="small"
+                    scroll={{ x: 1450 }}
+                    dataSource={activeStep.issues}
+                    columns={[
+                      {
+                        title: activeStep.step_id === 'full_document' ? '定位章节' : '当前章节',
+                        width: 280,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (_, it) => {
+                          const loc = getIssueLocation(it)
+                          return (
+                            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                              {loc.chapterText?.trim() ? (
+                                <Typography.Text
+                                  style={{
+                                    color: '#0F172A',
+                                    lineHeight: 1.7,
+                                    whiteSpace: 'normal',
+                                    wordBreak: 'break-word',
+                                  }}
+                                >
+                                  {loc.chapterText}
+                                </Typography.Text>
+                              ) : (
+                                <Tag color="warning">未定位到原文章节</Tag>
+                              )}
+                              {loc.userTitle ? (
+                                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                  文档标题：{loc.userTitle}
+                                </Typography.Text>
+                              ) : null}
+                            </Space>
+                          )
+                        },
+                      },
+                      {
+                        title: '问题',
+                        dataIndex: 'message',
+                        width: 360,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (v: string) => (
+                          <Typography.Text
+                            style={{
+                              color: '#0F172A',
+                              lineHeight: 1.7,
+                              whiteSpace: 'normal',
+                              wordBreak: 'break-word',
+                            }}
+                          >
+                            {v?.trim() || '—'}
+                          </Typography.Text>
+                        ),
+                      },
+                      {
+                        title: '证据/原文',
+                        width: 300,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (_, it) => {
+                          const evidence = getIssueOriginalText(it)
+                          return evidence ? (
+                            <Typography.Text
+                              type="secondary"
+                              style={{ whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: 1.7 }}
+                            >
+                              {evidence}
+                            </Typography.Text>
+                          ) : (
+                            <Tag color="warning">缺少证据，必须人工核验</Tag>
+                          )
+                        },
+                      },
+                      {
+                        title: '优化建议',
+                        width: 320,
+                        onHeaderCell: () => ({ style: MODERN_TABLE_HEADER_STYLE }),
+                        onCell: () => ({ style: MODERN_TABLE_CELL_STYLE }),
+                        render: (_, it) => {
+                          const suggestions = extractAiSuggestions(it.related)
+                          return suggestions.length > 0 ? (
+                            <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.8, color: '#334155' }}>
+                              {suggestions.map((s, idx) => (
+                                <li
+                                  key={`${it.issue_id || it.message}-${activeStep.step_id}-${idx}`}
+                                >
+                                  {s}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <Typography.Text type="secondary">
+                              模型未返回整改建议，请在模板提示词中补充「输出 suggestions」。
+                            </Typography.Text>
+                          )
+                        },
+                      },
+                    ]}
+                  />
+                </>
+              ) : (
+                <List
+                  dataSource={activeStep.issues}
+                  renderItem={(it) => (
+                    <List.Item>
+                      {(() => {
+                        const titlePath = asStringArray(it.anchor?.title_path)
+                        const templateNodeId =
+                          it.anchor?.template_node_id !== undefined &&
+                          it.anchor?.template_node_id !== null
+                            ? String(it.anchor.template_node_id)
+                            : ''
+                        const headingParaIndex =
+                          it.anchor?.heading_para_index !== undefined &&
+                          it.anchor?.heading_para_index !== null
+                            ? String(it.anchor.heading_para_index)
+                            : ''
+                        const userTitle =
+                          it.anchor?.user_title !== undefined && it.anchor?.user_title !== null
+                            ? String(it.anchor.user_title)
+                            : ''
+                        const normalizedLocation = getIssueLocation(it)
+                        const hasLocation = Boolean(
+                          normalizedLocation.chapterText ||
+                            normalizedLocation.templateNodeId ||
+                            normalizedLocation.headingParaIndex ||
+                            normalizedLocation.userTitle,
+                        )
+                        const evidenceText = getIssueOriginalText(it)
+                        const relatedText = relatedMetadataText(it.related)
+                        const standards = Array.from(
+                          new Set(
+                            [
+                              ...extractStandardsText(it.message ?? ''),
+                              ...extractStandardsText(it.evidence ?? ''),
+                              ...extractStandardsText(relatedText),
+                            ].filter(Boolean),
+                          ),
+                        )
+                        const suggestions = extractAiSuggestions(it.related)
+                        const showStandardReference = activeStep?.step_id === 'compilation_basis'
+                        return (
+                          <Card
+                            size="small"
+                            style={{
+                              width: '100%',
+                              borderRadius: 8,
+                              background: '#fff',
+                              boxShadow: '0 1px 3px rgba(0, 0, 0, 0.06)',
+                            }}
+                          >
+                            <div style={{ marginBottom: 10 }}>
+                              <Space wrap>
+                                <Tag color={SEVERITY_META[it.severity]?.color ?? 'default'}>
+                                  {SEVERITY_META[it.severity]?.label ?? it.severity}
+                                </Tag>
+                                {!hasLocation ? <Tag color="warning">未定位</Tag> : null}
+                                {!evidenceText ? <Tag color="warning">缺少证据</Tag> : null}
+                                <Typography.Text strong>问题：{it.message}</Typography.Text>
+                              </Space>
+                              {evidenceText ? (
+                                <Typography.Paragraph
+                                  type="secondary"
+                                  style={{ marginTop: 8, marginBottom: 0 }}
+                                >
+                                  证据：{evidenceText}
+                                </Typography.Paragraph>
+                              ) : (
+                                <Typography.Paragraph type="warning" style={{ marginTop: 8, marginBottom: 0 }}>
+                                  模型未返回可核验的原文证据，本问题不能直接作为最终结论。
+                                </Typography.Paragraph>
+                              )}
+                            </div>
+
+                            <div
+                              style={{
+                                marginBottom: 10,
+                                padding: '10px 12px',
+                                borderRadius: 6,
+                                background: 'var(--ant-color-fill-quaternary)',
+                              }}
+                            >
+                              <Typography.Text strong style={{ fontSize: 12 }}>
+                                定位数据
+                              </Typography.Text>
+                              <ul style={{ margin: '8px 0 0 18px', padding: 0 }}>
+                                {titlePath.length > 0 && <li>章节：{titlePath.join(' > ')}</li>}
+                                {titlePath.length === 0 && normalizedLocation.chapterText ? (
+                                  <li>章节：{normalizedLocation.chapterText}</li>
+                                ) : null}
+                                {!!templateNodeId && <li>模板节点：{templateNodeId}</li>}
+                                {!templateNodeId && normalizedLocation.templateNodeId ? (
+                                  <li>模板节点：{normalizedLocation.templateNodeId}</li>
+                                ) : null}
+                                {!!userTitle && <li>文档标题：{userTitle}</li>}
+                                {!userTitle && normalizedLocation.userTitle ? (
+                                  <li>文档标题：{normalizedLocation.userTitle}</li>
+                                ) : null}
+                                {!!headingParaIndex && <li>段落索引：{headingParaIndex}</li>}
+                                {!headingParaIndex && normalizedLocation.headingParaIndex ? (
+                                  <li>段落索引：{normalizedLocation.headingParaIndex}</li>
+                                ) : null}
+                                {!!relatedText && <li>审查依据与状态：{relatedText}</li>}
+                                {!hasLocation ? (
+                                  <li>未返回章节或段落定位，请人工在原方案中查找并确认。</li>
+                                ) : null}
+                              </ul>
+                            </div>
+
+                            <div
+                              style={{
+                                padding: '10px 12px',
+                                borderRadius: 6,
+                                background: '#f6ffed',
+                                border: '1px solid #d9f7be',
+                              }}
+                            >
+                              <Typography.Text strong style={{ fontSize: 12 }}>
+                                优化建议
+                              </Typography.Text>
+                              <ul style={{ margin: '8px 0 0 18px', padding: 0 }}>
+                                {suggestions.length > 0 ? (
+                                  suggestions.map((s, idx) => (
+                                    <li key={`${it.issue_id || it.message}-s-${idx}`}>{s}</li>
+                                  ))
+                                ) : (
+                                  <li>模型未返回整改建议，请在模板提示词中补充“输出 suggestions”。</li>
+                                )}
+                              </ul>
+                              {showStandardReference ? (
+                                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                  规范参考：
+                                  {standards.length > 0
+                                    ? standards.map((s) => ` ${s}`).join('；')
+                                    : ' 未识别到明确规范编号，建议补充引用条款（如 GB 50204、JGJ 162 等）。'}
+                                </Typography.Text>
+                              ) : null}
+                            </div>
+
+                            {it.anchor && Object.keys(it.anchor).length > 0 ? (
+                              <Collapse
+                                ghost
+                                style={{ marginTop: 4 }}
+                                items={[
+                                  {
+                                    key: 'raw-anchor',
+                                    label: '查看原始定位数据',
+                                    children: (
+                                      <pre
+                                        style={{
+                                          marginTop: 0,
+                                          marginBottom: 0,
+                                          fontSize: 11,
+                                          opacity: 0.85,
+                                          whiteSpace: 'pre-wrap',
+                                          wordBreak: 'break-word',
+                                        }}
+                                      >
+                                        {JSON.stringify(it.anchor, null, 2)}
+                                      </pre>
+                                    ),
+                                  },
+                                ]}
+                              />
+                            ) : null}
+                          </Card>
+                        )
+                      })()}
+                    </List.Item>
+                  )}
+                />
+              )}
+            </>
+          )}
+        </Card>
+      </div>
+    </div>
+  )
+}

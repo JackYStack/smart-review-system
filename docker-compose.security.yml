@@ -1,0 +1,33 @@
+# Production upload malware scanning overlay. ClamAV stays on the private
+# Compose network; clamd TCP must never be published to the host.
+services:
+  clamav:
+    image: clamav/clamav:${CLAMAV_IMAGE_TAG:-1.4.3}
+    restart: unless-stopped
+    expose:
+      - "3310"
+    volumes:
+      - clamav_database:/var/lib/clamav
+    mem_limit: ${CLAMAV_MEMORY_LIMIT:-4g}
+    cpus: ${CLAMAV_CPU_LIMIT:-2.0}
+    pids_limit: ${CLAMAV_PIDS_LIMIT:-256}
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE:-20m}
+        max-file: ${LOG_MAX_FILES:-5}
+
+  backend:
+    depends_on:
+      clamav:
+        condition: service_healthy
+    environment:
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: 3310
+      CLAMAV_TIMEOUT_SECONDS: ${CLAMAV_TIMEOUT_SECONDS:-60}
+      MALWARE_SCAN_REQUIRED: "true"
+
+volumes:
+  clamav_database:

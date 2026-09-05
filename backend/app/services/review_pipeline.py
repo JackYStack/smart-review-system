@@ -1,0 +1,2368 @@
+"""Scheme review workflow, LLM stages, explicit outcomes and Word output."""
+
+from __future__ import annotations
+
+import json
+import re
+import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from io import BytesIO
+from time import perf_counter
+from typing import Any, Callable, Literal
+
+import httpx
+from sqlalchemy import or_, text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, joinedload
+
+from app.database import SessionLocal
+from app.models.basis_item import BasisItem
+from app.models.rule_engine import ParameterValue
+from app.models.scheme_review_task import (
+    CompletenessStatus,
+    ReviewConclusion,
+    ReviewTaskStatus,
+    SchemeReviewTask,
+)
+from app.models.scheme_template import SchemeTemplate
+from app.models.scheme_type import SchemeType
+from app.schemas.review_report import ReportIssue, ReportStep, ReviewReportV1
+from app.schemas.template import FullDocumentReviewConfig, ReviewWorkflowData
+from app.services import minio_storage
+from app.services.doc_tree_utils import (
+    UserHeadingEntry,
+    build_user_heading_index,
+    collect_full_document_text,
+    collect_subtree_text,
+    format_heading_catalog,
+    iter_nodes,
+    parse_title_path_value,
+    resolve_heading_from_index,
+    resolve_user_node,
+    title_path_for_node,
+)
+from app.services.docx_image_assets import extract_and_store_docx_images
+from app.services.document_artifacts import record_document_artifact
+from app.services.docx_comments import inject_comments_at_paragraphs
+from app.services.dify_client import retrieve_dataset_chunks
+from app.services.dify_settings import get_dify_url_and_key
+from app.services.dify_workflow_client import DifyWorkflowClient, DifyWorkflowError
+from app.services.llm.chat import EMPTY_USAGE, TokenUsage, chat_json_with_usage
+from app.services.llm.resolve import effective_default_provider
+from app.services.integration_settings import (
+    resolve_document_integration,
+)
+from app.services.review_settings import (
+    get_compilation_basis_concurrency,
+    get_content_concurrency,
+    get_context_consistency_concurrency,
+    get_review_prompt_debug_enabled,
+    get_review_timeout_seconds,
+)
+from app.services.rule_engine import execute_rules_for_task, normalize_value
+from app.services.scheme_readiness import assess_scheme_readiness
+from app.services.template_versioning import resolve_task_template_snapshot
+from app.services.scheme_workflow_profile import resolve_task_workflow_snapshot
+from app.services.tree_align import align_template_user_trees, title_path_str
+from app.services.paddle_document_parser import parse_docx_to_tree_with_paddle
+
+LOCK_WAIT_TIMEOUT_SECONDS = 15
+
+
+def _ensure_expert_round(db: Session, task: SchemeReviewTask) -> None:
+    # Local import avoids a cycle: expert report generation reuses review
+    # report labels from this module.
+    from app.services.expert_review import ensure_round_for_task
+
+    ensure_round_for_task(db, task)
+
+# 写入 Word 批注时使用的步骤中文标签（与前端展示用语一致）
+WORD_COMMENT_STEP_LABEL_CN: dict[str, str] = {
+    "structure": "结构审核",
+    "compilation_basis": "编制依据审核",
+    "context_consistency": "上下文一致性",
+    "content": "内容审核",
+    "full_document": "通篇审核",
+    "dify_workflow": "Dify Workflow 全文审查",
+    "rules_and_formulas": "规则与公式验算",
+}
+
+FULL_DOCUMENT_TEXT_CAP = 80_000
+FULL_DOCUMENT_KB_CAP = 12_000
+FULL_DOCUMENT_HEADING_CATALOG_MAX = 300
+
+JSON_SYSTEM = """你是工程文档审核助手。你必须只输出一个 JSON 对象，不要用 markdown 代码块包裹。
+格式严格如下：
+{
+  "passed": true 或 false,
+  "summary": "一句话摘要",
+  "issues": [
+    {
+      "severity": "error",
+      "message": "问题说明",
+      "evidence": "文档中的依据摘录",
+      "related": { }
+    }
+  ]
+}
+severity 取值仅为 error、warning、info。若无问题，issues 为 [] 且 passed 为 true。related 可为空对象。"""
+
+FULL_DOCUMENT_JSON_SYSTEM = """你是工程文档审核助手。你必须只输出一个 JSON 对象，不要用 markdown 代码块包裹。
+格式严格如下：
+{
+  "passed": true 或 false,
+  "summary": "一句话摘要",
+  "issues": [
+    {
+      "severity": "error",
+      "message": "问题说明",
+      "evidence": "文档中的依据摘录",
+      "anchor": {
+        "heading_para_index": 128,
+        "title_path": ["六、施工管理及作业人员配备和分工", "4.其他作业人员"]
+      },
+      "related": { "suggestions": ["可执行整改建议"] }
+    }
+  ]
+}
+规则：
+- severity 取值仅为 error、warning、info。
+- 每条可定位到具体章节的问题，anchor 必须包含 heading_para_index（整数，取自【文档标题索引】或正文 [hpi=N]，禁止臆造）及 title_path（字符串数组，每级标题一项，须与该 hpi 的完整路径一致）。
+- 无法定位到具体章节时，可省略 anchor，但须在 message 中说明。
+- related.suggestions 为 string[]，给出可执行整改建议。
+- 若无问题，issues 为 [] 且 passed 为 true。"""
+
+_HPI_IN_TEXT_RE = re.compile(r"\[hpi=(\d+)\]|hpi\s*[:=]\s*(\d+)", re.IGNORECASE)
+
+_BASIS_ALLOWED_CATEGORIES = {"现行缺失", "废止误引"}
+_BASIS_MISSING_EVIDENCE = "文档全文及表格中未发现该规范的名称或编号。"
+
+
+class ReviewConfigurationError(RuntimeError):
+    """Stored scheme configuration cannot execute a substantive review."""
+
+
+class ReviewCancelled(RuntimeError):
+    """Raised at safe stage boundaries after a user cancellation request."""
+
+
+def _append_log(db: Session, task: SchemeReviewTask, level: str, message: str) -> None:
+    ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    task.review_log = (task.review_log or "") + f"[{ts}] {level.upper()} {message}\n"
+
+
+def _structure_issues_to_report(structure_raw: list[dict[str, Any]]) -> ReportStep:
+    issues: list[ReportIssue] = []
+    by_kind: dict[str, int] = {"missing_section": 0}
+    for raw in structure_raw:
+        kind = str(raw.get("kind") or "")
+        if kind in by_kind:
+            by_kind[kind] += 1
+        tp = raw.get("title_path") or []
+        if not isinstance(tp, list):
+            tp = []
+        hpi = raw.get("heading_para_index")
+        tid = raw.get("template_node_id")
+        anchor: dict[str, Any] = {"title_path": tp}
+        if tid is not None and str(tid).strip():
+            anchor["template_node_id"] = tid
+        ut = raw.get("user_title")
+        if ut is not None and str(ut).strip():
+            anchor["user_title"] = str(ut).strip()
+        if isinstance(hpi, int):
+            anchor["heading_para_index"] = hpi
+        if kind == "missing_section":
+            sev: Literal["error", "warning", "info"] = "error"
+        elif kind == "order_mismatch":
+            sev = "warning"
+        else:
+            sev = "error"
+        issues.append(
+            ReportIssue(
+                severity=sev,
+                message=str(raw.get("message") or ""),
+                evidence="",
+                anchor=anchor,
+                related={"kind": kind},
+            )
+        )
+    n_miss = by_kind["missing_section"]
+    if not issues:
+        summary = "结构审核通过"
+    else:
+        parts = [f"共 {len(issues)} 项结构问题"]
+        if n_miss:
+            parts.append(f"（缺失 {n_miss}）")
+        summary = "".join(parts)
+    return ReportStep(
+        step_id="structure",
+        passed=len(issues) == 0,
+        summary=summary,
+        issues=issues,
+    )
+
+
+def _coerce_int_hpi(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value == int(value):
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _extract_hpi_from_text(text: str) -> int | None:
+    for m in _HPI_IN_TEXT_RE.finditer(text or ""):
+        g = m.group(1) or m.group(2)
+        if g and g.isdigit():
+            return int(g)
+    return None
+
+
+def _coerce_raw_issue_anchor(it: dict[str, Any]) -> dict[str, Any]:
+    """Normalize LLM issue dict into anchor fields (full-document and legacy shapes)."""
+    anchor: dict[str, Any] = {}
+    extra = it.get("anchor")
+    if isinstance(extra, dict):
+        anchor.update(extra)
+
+    for key in ("heading_para_index", "title_path", "user_title", "template_node_id"):
+        if key in it and it[key] is not None and key not in anchor:
+            anchor[key] = it[key]
+
+    hpi = _coerce_int_hpi(anchor.get("heading_para_index"))
+    if hpi is not None:
+        anchor["heading_para_index"] = hpi
+    elif "heading_para_index" in anchor:
+        del anchor["heading_para_index"]
+
+    path = parse_title_path_value(anchor.get("title_path"))
+    if path:
+        anchor["title_path"] = path
+
+    rel = it.get("related")
+    if not isinstance(rel, dict):
+        return anchor
+
+    loc = rel.get("location")
+    if isinstance(loc, str) and loc.strip():
+        loc_path = parse_title_path_value(loc)
+        if loc_path and not anchor.get("title_path"):
+            anchor["title_path"] = loc_path
+    elif isinstance(loc, dict):
+        if anchor.get("heading_para_index") is None:
+            loc_hpi = _coerce_int_hpi(loc.get("heading_para_index"))
+            if loc_hpi is not None:
+                anchor["heading_para_index"] = loc_hpi
+        if not anchor.get("title_path"):
+            loc_path = parse_title_path_value(loc.get("chapter_path")) or parse_title_path_value(
+                loc.get("chapter_text")
+            )
+            if loc_path:
+                anchor["title_path"] = loc_path
+
+    if not anchor.get("title_path"):
+        for key in ("chapter", "chapter_a", "chapter_text", "title_path"):
+            rel_path = parse_title_path_value(rel.get(key))
+            if rel_path:
+                anchor["title_path"] = rel_path
+                break
+
+    return anchor
+
+
+def _normalize_llm_step(
+    step_id: str,
+    data: dict[str, Any],
+    anchor_base: dict[str, Any],
+) -> ReportStep:
+    raw_issues = data.get("issues")
+    if not isinstance(raw_issues, list):
+        raw_issues = []
+    issues: list[ReportIssue] = []
+    for it in raw_issues:
+        if not isinstance(it, dict):
+            continue
+        sev = str(it.get("severity") or "error")
+        if sev not in ("error", "warning", "info"):
+            sev = "error"
+        rel = it.get("related")
+        if not isinstance(rel, dict):
+            rel = {}
+        raw_category = str(it.get("category") or "").strip()
+        if raw_category and not str(rel.get("category") or "").strip():
+            rel["category"] = raw_category
+        coerced_anchor = _coerce_raw_issue_anchor(it)
+        anchor = {**anchor_base, **coerced_anchor}
+        issues.append(
+            ReportIssue(
+                severity=sev,  # type: ignore[arg-type]
+                message=str(it.get("message") or ""),
+                evidence=str(it.get("evidence") or ""),
+                anchor=anchor,
+                related=rel,
+            )
+        )
+    passed = bool(data.get("passed")) if "passed" in data else len(issues) == 0
+    if issues:
+        passed = False
+    return ReportStep(
+        step_id=step_id,
+        passed=passed,
+        summary=str(data.get("summary") or ""),
+        issues=issues,
+    )
+
+
+LogLine = tuple[str, str]
+
+
+def _llm_review_execute(
+    db: Session,
+    *,
+    step_id: str,
+    user_prompt: str,
+    anchor_base: dict[str, Any],
+    collect_debug: bool,
+    timeout_seconds: float = 120.0,
+    timeout_fail_fast: bool = False,
+    system: str | None = None,
+) -> tuple[ReportStep, TokenUsage, list[LogLine], dict[str, Any] | None]:
+    """LLM JSON 审核（不写入 task.review_log）；日志行由调用方在主线程写入。"""
+    log_lines: list[LogLine] = []
+    debug_entry: dict[str, Any] | None = None
+    system_prompt = system or JSON_SYSTEM
+    if collect_debug:
+        debug_entry = {
+            "step_id": step_id,
+            "template_node_id": str(anchor_base.get("template_node_id") or ""),
+            "title_path": anchor_base.get("title_path") or [],
+            "prompt_text": user_prompt,
+            "prompt_length": len(user_prompt),
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+    try:
+        data, usage = chat_json_with_usage(
+            db,
+            user_message=user_prompt,
+            system=system_prompt,
+            max_tokens=8192,
+            timeout=timeout_seconds,
+        )
+    except Exception as first:
+        log_lines.append(("warning", f"{step_id} LLM 首次解析失败，重试: {first!s}"))
+        try:
+            data, usage = chat_json_with_usage(
+                db,
+                user_message=user_prompt + "\n\n上一输出不是合法 JSON。请只输出一个 JSON 对象，键为 passed, summary, issues。",
+                system=system_prompt,
+                max_tokens=8192,
+                timeout=timeout_seconds,
+            )
+        except Exception as second:
+            log_lines.append(("error", f"{step_id} LLM 失败: {second!s}"))
+            if timeout_fail_fast and _is_timeout_error(second):
+                raise TimeoutError(f"{step_id} 超时（>{int(timeout_seconds)} 秒）") from second
+            return (
+                ReportStep(
+                    step_id=step_id,
+                    passed=False,
+                    summary="模型调用或 JSON 解析失败",
+                    issues=[
+                        ReportIssue(
+                            severity="error",
+                            message=str(second),
+                            anchor=anchor_base,
+                            related={
+                                "technical_error": True,
+                                "component": "llm",
+                                "completeness_impact": "unavailable",
+                            },
+                        )
+                    ],
+                ),
+                {"input_tokens": None, "output_tokens": None, "total_tokens": None},
+                log_lines,
+                debug_entry,
+            )
+    return _normalize_llm_step(step_id, data, anchor_base), usage, log_lines, debug_entry
+
+
+def _llm_review(
+    db: Session,
+    task: SchemeReviewTask,
+    *,
+    step_id: str,
+    user_prompt: str,
+    anchor_base: dict[str, Any],
+    debug_prompts: list[dict[str, Any]] | None = None,
+    timeout_seconds: float = 120.0,
+    timeout_fail_fast: bool = False,
+) -> tuple[ReportStep, TokenUsage]:
+    sub, usage, log_lines, dbg = _llm_review_execute(
+        db,
+        step_id=step_id,
+        user_prompt=user_prompt,
+        anchor_base=anchor_base,
+        collect_debug=debug_prompts is not None,
+        timeout_seconds=timeout_seconds,
+        timeout_fail_fast=timeout_fail_fast,
+    )
+    for level, msg in log_lines:
+        _append_log(db, task, level, msg)
+    if dbg is not None and debug_prompts is not None:
+        debug_prompts.append(dbg)
+    return sub, usage
+
+
+def _bounded_parallel_map(
+    *,
+    concurrency: int,
+    items: list[tuple[int, Any]],
+    worker: Callable[[Any], Any],
+) -> list[tuple[int, Any]]:
+    """按 work index 并行执行，返回 (idx, result) 列表（顺序不保证，由调用方排序）。"""
+    if not items:
+        return []
+    max_workers = max(1, min(int(concurrency), len(items)))
+    out: list[tuple[int, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {pool.submit(worker, payload): idx for idx, payload in items}
+        for fut in as_completed(future_map):
+            idx = future_map[fut]
+            out.append((idx, fut.result()))
+    return out
+
+
+def _content_node_worker(
+    payload: tuple[
+        int,
+        dict[str, Any],
+        list[dict[str, Any]],
+        dict[str, dict[str, Any]],
+        str | None,
+        str | None,
+        int,
+        bool,
+        str,
+        int,
+    ],
+) -> tuple[int, ReportStep, TokenUsage, list[LogLine], dict[str, Any] | None]:
+    """单节点：知识库检索 + LLM；不写入主库，日志行返回给主线程按序写入。"""
+    (
+        work_idx,
+        tn,
+        template_nodes,
+        mapping,
+        dify_url,
+        dify_key,
+        review_timeout_seconds,
+        prompt_debug_enabled,
+        step_id,
+        len_content_nodes,
+    ) = payload
+    logs: list[LogLine] = []
+    node_t0 = perf_counter()
+    tid = str(tn.get("id") or "")
+    rp = (tn.get("review_prompt") or "").strip() if isinstance(tn.get("review_prompt"), str) else ""
+    node_title = title_path_str(title_path_for_node(template_nodes, tid)) or str(tn.get("title") or "")
+    logs.append(
+        (
+            "info",
+            f"content 节点开始 [{work_idx + 1}/{len_content_nodes}] id={tid} 标题={node_title}",
+        )
+    )
+
+    ldb = SessionLocal()
+    try:
+        un = resolve_user_node(mapping, tid)
+        if un is None:
+            logs.append(("warning", f"content 节点跳过（未匹配用户节点）id={tid}"))
+            return (
+                work_idx,
+                ReportStep(step_id=step_id, passed=True, summary="", issues=[]),
+                EMPTY_USAGE,
+                logs,
+                None,
+            )
+
+        current_text = collect_subtree_text(un)
+        ref_ids = tn.get("ref_node_ids") or []
+        ref_chunks: list[str] = []
+        if isinstance(ref_ids, list):
+            for rid in ref_ids:
+                ru = resolve_user_node(mapping, str(rid))
+                if ru is not None:
+                    ref_chunks.append(collect_subtree_text(ru))
+        ref_text = "\n\n---\n\n".join(ref_chunks)
+        kb_text = ""
+        kb_degraded_message = ""
+        ds = tn.get("dify_dataset_id")
+        if ds and dify_url and dify_key:
+            kws = tn.get("knowledge_keywords") or []
+            qparts: list[str] = []
+            if isinstance(kws, list):
+                qparts.extend(str(x).strip() for x in kws if str(x).strip())
+            if not qparts:
+                qparts.append(str(tn.get("title") or "").strip())
+            query = " ".join(qparts)[:250]
+            kb_t0 = perf_counter()
+            try:
+                kb_text = retrieve_dataset_chunks(dify_url, dify_key, str(ds), query)
+            except Exception as e:
+                if _is_timeout_error(e):
+                    raise TimeoutError(
+                        f"content 节点 [{work_idx + 1}/{len_content_nodes}] 知识库检索超时（dataset={ds}）"
+                    ) from e
+                kb_degraded_message = f"dataset={ds}; {type(e).__name__}: {e!s}"[:1000]
+                logs.append(
+                    (
+                        "warning",
+                        f"content 节点知识库检索跳过 id={tid} dataset={ds}: {e!s}",
+                    )
+                )
+            finally:
+                kb_elapsed_ms = int((perf_counter() - kb_t0) * 1000)
+                logs.append(
+                    (
+                        "info",
+                        f"content 节点知识库检索完成 id={tid} 用时={kb_elapsed_ms}ms",
+                    )
+                )
+        tp = title_path_for_node(template_nodes, tid)
+        hpi = un.get("heading_para_index")
+        anchor = {
+            "template_node_id": tid,
+            "title_path": tp,
+            "heading_para_index": hpi,
+        }
+        prompt = _content_prompt(current_text, ref_text, kb_text, rp)
+        llm_t0 = perf_counter()
+        try:
+            sub, usage, ll_logs, dbg = _llm_review_execute(
+                ldb,
+                step_id=step_id,
+                user_prompt=prompt,
+                anchor_base=anchor,
+                collect_debug=prompt_debug_enabled,
+                timeout_seconds=float(review_timeout_seconds),
+                timeout_fail_fast=True,
+            )
+            logs.extend(ll_logs)
+        except TimeoutError as e:
+            llm_elapsed_ms = int((perf_counter() - llm_t0) * 1000)
+            logs.append(
+                (
+                    "info",
+                    f"content 节点模型调用完成 id={tid} 用时={llm_elapsed_ms}ms",
+                )
+            )
+            raise TimeoutError(
+                f"content 节点 [{work_idx + 1}/{len_content_nodes}] LLM 调用超时（>{review_timeout_seconds}秒）"
+            ) from e
+        else:
+            llm_elapsed_ms = int((perf_counter() - llm_t0) * 1000)
+            logs.append(
+                (
+                    "info",
+                    f"content 节点模型调用完成 id={tid} 用时={llm_elapsed_ms}ms",
+                )
+            )
+
+        if kb_degraded_message:
+            sub.issues.append(
+                ReportIssue(
+                    severity="warning",
+                    message="法规知识库检索未完成，本章节审核结果不完整",
+                    evidence=kb_degraded_message,
+                    anchor=anchor,
+                    related={
+                        "technical_error": True,
+                        "component": "dify_dataset",
+                        "integration_error": True,
+                        "completeness_impact": "partial",
+                    },
+                )
+            )
+            sub.passed = False
+
+        node_elapsed_ms = int((perf_counter() - node_t0) * 1000)
+        logs.append(
+            (
+                "info",
+                (
+                    f"content 节点完成 [{work_idx + 1}/{len_content_nodes}] id={tid} "
+                    f"总用时={node_elapsed_ms}ms 累计tokens={{tokens_placeholder}}"
+                ),
+            )
+        )
+        return (work_idx, sub, usage, logs, dbg)
+    finally:
+        ldb.close()
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    text = str(exc).lower()
+    return ("timeout" in text) or ("timed out" in text) or ("超时" in text)
+
+
+def _merge_usage(total: TokenUsage, delta: TokenUsage) -> None:
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        d = delta.get(key)
+        if d is None:
+            continue
+        existing = total.get(key)
+        total[key] = (existing or 0) + d
+
+
+def _write_usage_snapshot(task: SchemeReviewTask, total: TokenUsage) -> None:
+    task.input_tokens = total["input_tokens"] or None
+    task.output_tokens = total["output_tokens"] or None
+    task.total_tokens = total["total_tokens"] or None
+
+
+def _as_utc_aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _finalize_timing_and_tokens(task: SchemeReviewTask) -> None:
+    finished = datetime.now(UTC)
+    task.finished_at = finished
+    if task.started_at is not None:
+        started = _as_utc_aware(task.started_at)
+        duration = finished - started
+        task.duration_ms = max(0, int(duration.total_seconds() * 1000))
+    task.lease_owner = None
+    task.lease_expires_at = None
+
+
+def _raise_if_cancel_requested(db: Session, task: SchemeReviewTask) -> None:
+    db.refresh(task, attribute_names=["cancel_requested_at"])
+    if task.cancel_requested_at is not None:
+        raise ReviewCancelled("用户已请求取消审核任务")
+
+
+def _recover_stale_processing_tasks(db: Session, *, current_task_id: int, stale_minutes: int = 5) -> int:
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(minutes=stale_minutes)
+    rows = (
+        db.query(SchemeReviewTask)
+        .filter(
+            SchemeReviewTask.status == ReviewTaskStatus.processing,
+            or_(
+                SchemeReviewTask.lease_expires_at < now,
+                (
+                    SchemeReviewTask.lease_expires_at.is_(None)
+                    & (SchemeReviewTask.updated_at < cutoff)
+                ),
+            ),
+            SchemeReviewTask.id != current_task_id,
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+    for row in rows:
+        _append_log(
+            db,
+            row,
+            "error",
+            "检测到任务长时间处于 processing，已自动回收为失败（疑似进程中断或提交阶段未完成）",
+        )
+        row.status = ReviewTaskStatus.failed
+        row.review_conclusion = ReviewConclusion.not_reviewed
+        row.completeness_status = CompletenessStatus.unavailable
+        row.review_stage = None
+        row.error_message = "Auto recovered: stale processing task"
+        _finalize_timing_and_tokens(row)
+        _ensure_expert_round(db, row)
+    db.commit()
+    return len(rows)
+
+
+def _review_result_to_json(
+    report: ReviewReportV1,
+    *,
+    debug_prompts: list[dict[str, Any]] | None = None,
+) -> str:
+    payload: dict[str, Any] = report.model_dump(mode="json")
+    if debug_prompts:
+        payload["debug_prompts"] = debug_prompts
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _derive_task_outcome(report: ReviewReportV1) -> tuple[str, str]:
+    """Return (review_conclusion, completeness_status).
+
+    Technical issues never become a business "issues found" conclusion. A
+    partially executed review can still retain confirmed business findings,
+    while a clean conclusion is only allowed when all configured stages ran.
+    """
+
+    impact_levels: list[str] = []
+    business_issue_count = 0
+    business_failed_without_issue = False
+    for step in report.steps:
+        for issue in step.issues:
+            related = issue.related if isinstance(issue.related, dict) else {}
+            if related.get("technical_error"):
+                impact = str(related.get("completeness_impact") or "partial")
+                impact_levels.append(impact)
+            else:
+                business_issue_count += 1
+        if not step.passed and not step.issues:
+            business_failed_without_issue = True
+
+    if "unavailable" in impact_levels:
+        completeness = CompletenessStatus.unavailable
+    elif impact_levels:
+        completeness = CompletenessStatus.partial
+    else:
+        completeness = CompletenessStatus.complete
+
+    if business_issue_count or business_failed_without_issue:
+        conclusion = ReviewConclusion.issues_found
+    elif completeness == CompletenessStatus.complete:
+        conclusion = ReviewConclusion.passed
+    else:
+        conclusion = ReviewConclusion.not_reviewed
+    return str(conclusion), str(completeness)
+
+
+def _classify_issue_evidence(report: ReviewReportV1) -> None:
+    """Make the legal-evidence boundary explicit before persistence/export.
+
+    Free-form model text is useful for finding candidates, but it is not a
+    traceable compliance finding unless the exact standard and clause payload
+    survived the pipeline.  The UI and expert workflow can therefore avoid
+    presenting an unsupported candidate as a confirmed violation.
+    """
+
+    for step in report.steps:
+        for issue in step.issues:
+            related = issue.related if isinstance(issue.related, dict) else {}
+            issue.related = related
+            if related.get("technical_error"):
+                related["evidence_status"] = "technical"
+                related["formal_violation"] = False
+                continue
+            verified = all(
+                str(related.get(key) or "").strip()
+                for key in ("standard_no", "clause_no", "clause_text")
+            ) and bool(str(issue.evidence or "").strip())
+            if step.step_id == "rules_and_formulas":
+                raw_inputs = related.get("inputs")
+                parameter_inputs = (
+                    [value for value in raw_inputs.values() if isinstance(value, dict)]
+                    if isinstance(raw_inputs, dict)
+                    else []
+                )
+                for parameter in parameter_inputs:
+                    # Numerical compliance is reproducible only when every
+                    # extracted value points back to the scheme.  Unverified
+                    # LLM extraction remains a candidate for expert review.
+                    if not isinstance(parameter.get("source"), dict) or not parameter["source"]:
+                        verified = False
+                    if (
+                        str(parameter.get("extraction_method") or "") == "llm"
+                        and not bool(parameter.get("verified"))
+                    ):
+                        verified = False
+            if verified:
+                related["evidence_status"] = "verified"
+                related["formal_violation"] = True
+                related["requires_human_judgement"] = False
+            else:
+                related["evidence_status"] = "unverified"
+                related["formal_violation"] = False
+                related["requires_human_judgement"] = True
+                related.setdefault("judgement", "suspected_pending_human")
+
+
+def _strip_json_fence(value: str) -> str:
+    text_value = (value or "").strip()
+    if text_value.startswith("```") and text_value.endswith("```"):
+        lines = text_value.splitlines()
+        if len(lines) >= 3:
+            return "\n".join(lines[1:-1]).strip()
+    return text_value
+
+
+def _dify_issue_from_dict(raw: dict[str, Any]) -> ReportIssue:
+    severity = str(raw.get("severity") or "warning").lower()
+    if severity not in ("error", "warning", "info"):
+        severity = "warning"
+    message = str(
+        raw.get("message")
+        or raw.get("title")
+        or raw.get("problem")
+        or raw.get("问题")
+        or "Dify Workflow 发现待复核问题"
+    ).strip()
+    evidence = str(
+        raw.get("evidence")
+        or raw.get("original_text")
+        or raw.get("依据")
+        or ""
+    ).strip()
+    anchor = raw.get("anchor") if isinstance(raw.get("anchor"), dict) else {}
+    related = raw.get("related") if isinstance(raw.get("related"), dict) else {}
+    for key in ("suggestions", "suggestion", "location", "standard_no", "doc_name"):
+        if key in raw and key not in related:
+            related[key] = raw[key]
+    return ReportIssue(
+        severity=severity,  # type: ignore[arg-type]
+        message=message,
+        evidence=evidence,
+        anchor=anchor,
+        related=related,
+    )
+
+
+def _markdown_dify_issues(report_text: str) -> list[ReportIssue]:
+    """Extract the documented `### 问题N` Markdown report format."""
+
+    pattern = re.compile(
+        r"(?m)^###\s*问题\s*\d+\s*[:：]\s*(?P<title>[^\r\n]+)\s*$"
+    )
+    matches = list(pattern.finditer(report_text))
+    issues: list[ReportIssue] = []
+
+    def field(block: str, label: str) -> str:
+        match = re.search(
+            rf"(?m)^\s*-\s*(?:\*\*)?{re.escape(label)}(?:\*\*)?\s*[:：]\s*(.+?)\s*$",
+            block,
+        )
+        return match.group(1).strip() if match else ""
+
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(report_text)
+        block = report_text[match.end() : end]
+        risk = field(block, "风险等级")
+        severity = (
+            "error"
+            if any(word in risk for word in ("严重", "高危", "高风险", "重大"))
+            else "warning"
+            if any(word in risk for word in ("中危", "中风险", "一般"))
+            else "info"
+        )
+        evidence = field(block, "方案证据") or field(block, "方案现状")
+        suggestion = field(block, "整改建议")
+        related: dict[str, Any] = {"report_format": "markdown", "risk_level": risk}
+        if suggestion:
+            related["suggestions"] = [suggestion]
+        standard = field(block, "审查依据")
+        if standard:
+            related["standards"] = standard
+        required = field(block, "复核所需资料")
+        if required:
+            related["required_materials"] = required
+        issues.append(
+            ReportIssue(
+                severity=severity,  # type: ignore[arg-type]
+                message=match.group("title").strip(),
+                evidence=evidence or block.strip()[:2000],
+                related=related,
+            )
+        )
+    return issues
+
+
+def dify_report_to_step(report_text: str, output_format: str = "auto") -> ReportStep:
+    """Prefer structured JSON; preserve text reports as an explicit review item."""
+
+    cleaned = _strip_json_fence(report_text)
+    parsed = None
+    if output_format != "markdown":
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            parsed = None
+
+    if isinstance(parsed, dict):
+        raw_steps = parsed.get("steps")
+        if isinstance(raw_steps, list):
+            issues: list[ReportIssue] = []
+            summaries: list[str] = []
+            passed = True
+            for raw_step in raw_steps:
+                if not isinstance(raw_step, dict):
+                    continue
+                if raw_step.get("passed") is False:
+                    passed = False
+                summary = str(raw_step.get("summary") or "").strip()
+                if summary:
+                    summaries.append(summary)
+                raw_issues = raw_step.get("issues")
+                if isinstance(raw_issues, list):
+                    issues.extend(
+                        _dify_issue_from_dict(item)
+                        for item in raw_issues
+                        if isinstance(item, dict)
+                    )
+            if issues:
+                passed = False
+            return ReportStep(
+                step_id="dify_workflow",
+                passed=passed,
+                summary="；".join(summaries) or "Dify Workflow 结构化审查完成",
+                issues=issues,
+            )
+
+        raw_issues = parsed.get("issues")
+        if isinstance(raw_issues, list):
+            issues = [
+                _dify_issue_from_dict(item)
+                for item in raw_issues
+                if isinstance(item, dict)
+            ]
+            passed_value = parsed.get("passed")
+            passed = bool(passed_value) if isinstance(passed_value, bool) else not issues
+            if issues:
+                passed = False
+            return ReportStep(
+                step_id="dify_workflow",
+                passed=passed,
+                summary=str(parsed.get("summary") or "Dify Workflow 结构化审查完成"),
+                issues=issues,
+            )
+
+    if output_format in ("auto", "markdown"):
+        markdown_issues = _markdown_dify_issues(report_text)
+        if markdown_issues:
+            return ReportStep(
+                step_id="dify_workflow",
+                passed=False,
+                summary=f"Dify Workflow Markdown 报告解析完成，发现 {len(markdown_issues)} 项问题。",
+                issues=markdown_issues,
+            )
+
+    return ReportStep(
+        step_id="dify_workflow",
+        passed=False,
+        summary="Dify Workflow 已返回文本审查报告，需人工确认后闭环。",
+        issues=[
+            ReportIssue(
+                severity="info",
+                message="查看并确认 Dify Workflow 全文审查报告",
+                evidence=report_text[:20_000],
+                related={"report_format": "text"},
+            )
+        ],
+    )
+
+
+def _persist_dify_parameter_candidates(
+    db: Session,
+    task: SchemeReviewTask,
+    report_text: str,
+) -> int:
+    """Persist structured Dify parameter candidates without claiming verification."""
+
+    try:
+        payload = json.loads(_strip_json_fence(report_text))
+    except (TypeError, json.JSONDecodeError):
+        return 0
+    raw_parameters = payload.get("parameters") if isinstance(payload, dict) else None
+    if not isinstance(raw_parameters, list):
+        return 0
+    saved = 0
+    for raw in raw_parameters[:500]:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("parameter_name") or "").strip()[:128]
+        unit = str(raw.get("unit") or "").strip()[:32]
+        source = raw.get("source")
+        if not name or not isinstance(source, dict) or not source:
+            continue
+        try:
+            numeric = Decimal(str(raw.get("numeric_value")))
+            normalized, normalized_unit = normalize_value(numeric, unit)
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        confidence: Decimal | None = None
+        if raw.get("confidence") is not None:
+            try:
+                candidate_confidence = Decimal(str(raw.get("confidence")))
+                if Decimal("0") <= candidate_confidence <= Decimal("1"):
+                    confidence = candidate_confidence
+            except (InvalidOperation, ValueError, TypeError):
+                confidence = None
+        row = (
+            db.query(ParameterValue)
+            .filter(
+                ParameterValue.task_id == task.id,
+                ParameterValue.parameter_name == name,
+            )
+            .first()
+        )
+        # Never let a later model run overwrite a value already verified by an
+        # expert.  Re-running the task therefore remains audit-safe.
+        if row is not None and row.verified_by_id is not None and row.verified_at is not None:
+            continue
+        if row is None:
+            row = ParameterValue(task_id=task.id, parameter_name=name)
+            db.add(row)
+        row.raw_value = str(raw.get("raw_value") or raw.get("numeric_value"))[:255]
+        row.numeric_value = numeric
+        row.unit = unit
+        row.normalized_value = normalized
+        row.normalized_unit = normalized_unit
+        row.source_json = json.dumps(source, ensure_ascii=False, separators=(",", ":"))
+        row.extraction_method = "llm"
+        row.confidence = confidence
+        row.verified_by_id = None
+        row.verified_at = None
+        saved += 1
+    if saved:
+        db.flush()
+    return saved
+
+
+def _basis_catalog_from_rows(rows: list[BasisItem]) -> str:
+    lines = []
+    for r in rows:
+        mandatory = "是" if bool(r.is_mandatory) else "否"
+        lines.append(
+            f"- 文献类型: {r.doc_type} | 标准号: {r.standard_no} | 名称: {r.doc_name} | 效力: {r.effect_status} | 必引: {mandatory}"
+        )
+    return "\n".join(lines) if lines else "(编制依据库中暂无记录)"
+
+
+def _basis_prompt(full_content: str, rows: list[BasisItem]) -> str:
+    catalog = _basis_catalog_from_rows(rows)
+    return (
+        "# Role\n"
+        "你是一位极其严谨的建筑工程文档合规性审核专家。\n\n"
+        "# Task\n"
+        "对比【待审文档】与【标准规范列表】，识别“现行必引缺失”与“废止误引”两类合规性问题。\n"
+        "说明：输入文本已剔除“精确匹配已命中”的行；仅对剩余文本与剩余条目执行匹配。\n\n"
+        "# Process Logic\n"
+        "1. 提取待审文档正文和 [表格第N行] 中出现的所有标准号（如 GB50007-2011）和名称（如 建筑地基基础设计规范）。\n"
+        "2. 将提取结果与【标准规范列表】逐一比对：\n"
+        "   - 规则A（现行缺失）：若列表条目为“效力：现行”且“必引：是”，但其标准号和名称均未出现在文档中，判定为“现行缺失”。\n"
+        "   - 规则B（废止误引）：若列表条目为“效力：废止”，但其标准号或名称出现在文档中，判定为“废止误引”。\n"
+        "   - 规则C：忽略列表外多余引用；忽略列表内“必引：否”且文档未引用的条目。\n\n"
+        "# Constraints\n"
+        "- issues 仅允许包含“现行缺失”“废止误引”。\n"
+        "- 每条 issue 必须包含 category，且只能是“现行缺失”或“废止误引”。\n"
+        "- 禁止输出模糊表述（如“建议核实”“需确认”“可能”“请核查”），必须给出确定性判定。\n"
+        f"- 若问题类型为“现行缺失”，evidence 固定填写：{_BASIS_MISSING_EVIDENCE}\n"
+        "- 若问题类型为“废止误引”，evidence 必须是文档原文或表格展开内容中的直接摘录。\n"
+        "- 若某条废止规范未被引用，不得为其生成 issue。\n"
+        "- 每条 issue 的 related.suggestions 必须返回 1~2 条可执行整改动作，使用祈使句，禁止空数组。\n"
+        "- 建议语句必须包含明确对象（标准号或规范名称）与动作（补充引用/删除替换/同步修订）。\n"
+        "- category=现行缺失 时，suggestions 优先使用“在编制依据中补充引用《规范名》（标准号）”类动作。\n"
+        "- category=废止误引 时，suggestions 优先使用“删除废止规范并替换为现行版本”类动作。\n"
+        "- 严格按给定 JSON 结构输出，不要新增、改名字段。\n"
+        "- 仅输出 JSON 对象本体，不要输出任何额外解释或 Markdown 代码块。\n\n"
+        "# Data Source\n"
+        "【待审文档】：\n"
+        "以下内容为待审文档中与编制依据相关的章节全文（若有表格，已按“[表格第N行] 单元格1 | 单元格2 ...”展开）：\n\n"
+        "---\n"
+        f"{full_content[:24000]}\n"
+        "---\n\n"
+        "【标准规范列表】：\n"
+        "以下为该方案类型在系统中登记的编制依据条目（审核必须完全依照该列表执行）：\n"
+        f"{catalog}\n\n"
+        "# Suggestions Template\n"
+        "- 现行缺失示例：['在编制依据中补充引用《建筑地基基础设计规范》（GB50007-2011）', '补充后同步检查目录与正文引用名称一致']\n"
+        "- 废止误引示例：['从编制依据中删除《建设工程高大模板支撑系统施工安全监督导则》（建办质[2009]254号）', '将该废止规范替换为对应现行标准并同步修订正文引用']\n\n"
+        "# Output Format\n"
+        "请严格按照以下 JSON 结构输出：\n"
+        '{"passed": boolean, "summary": string, "issues": [{"category": "现行缺失|废止误引", "message": string, "evidence": string, "related": {"standard_no": string, "doc_name": string, "suggestions": string[]}}]}'
+    )
+
+
+def _normalize_basis_issue_related(issue: ReportIssue) -> None:
+    related = issue.related if isinstance(issue.related, dict) else {}
+    anchor = issue.anchor if isinstance(issue.anchor, dict) else {}
+
+    suggestions: list[str] = []
+    raw_suggestions = related.get("suggestions")
+    if isinstance(raw_suggestions, list):
+        suggestions.extend(str(x).strip() for x in raw_suggestions if str(x).strip())
+    for key in ("suggestion", "optimize_suggestion", "optimization_suggestion"):
+        text = str(related.get(key) or "").strip()
+        if text:
+            suggestions.append(text)
+    deduped_suggestions: list[str] = []
+    for item in suggestions:
+        if item not in deduped_suggestions:
+            deduped_suggestions.append(item)
+    standard_no = str(related.get("standard_no") or "").strip()
+    doc_name = str(related.get("doc_name") or "").strip()
+    raw_category = str(related.get("category") or "").strip()
+    category = raw_category if raw_category in _BASIS_ALLOWED_CATEGORIES else ""
+    if not category:
+        msg = issue.message.strip()
+        if "废止" in msg or "失效" in msg:
+            category = "废止误引"
+        else:
+            category = "现行缺失"
+    related["category"] = category
+
+    if category == "现行缺失":
+        issue.evidence = _BASIS_MISSING_EVIDENCE
+    elif not str(issue.evidence or "").strip():
+        issue.evidence = str(related.get("original_text") or "").strip()
+
+    if not deduped_suggestions:
+        if category == "废止误引":
+            subject = f"《{doc_name}》（{standard_no}）" if doc_name or standard_no else "该废止规范"
+            deduped_suggestions = [
+                f"从编制依据中删除{subject}",
+                "将该废止规范替换为对应现行标准并同步修订正文引用",
+            ]
+        else:
+            subject = f"《{doc_name}》（{standard_no}）" if doc_name or standard_no else "相关现行必引规范（标准号待补充）"
+            deduped_suggestions = [
+                f"在编制依据中补充引用{subject}",
+                "补充后同步检查目录与正文引用名称一致",
+            ]
+    related["suggestions"] = deduped_suggestions[:2]
+    related["standard_no"] = standard_no
+    related["doc_name"] = doc_name
+
+    related["original_text"] = str(related.get("original_text") or issue.evidence or "").strip()
+
+    chapter_path_raw = anchor.get("title_path")
+    chapter_path = [str(x).strip() for x in chapter_path_raw] if isinstance(chapter_path_raw, list) else []
+    chapter_path = [x for x in chapter_path if x]
+    template_node_id = str(anchor.get("template_node_id") or "").strip()
+    user_title = str(anchor.get("user_title") or "").strip()
+    heading_para_index_raw = anchor.get("heading_para_index")
+    heading_para_index = heading_para_index_raw if isinstance(heading_para_index_raw, int) else None
+    related["location"] = {
+        "chapter_path": chapter_path,
+        "chapter_text": " > ".join(chapter_path),
+        "template_node_id": template_node_id,
+        "heading_para_index": heading_para_index,
+        "user_title": user_title,
+    }
+
+    issue.related = related
+
+
+def _normalize_context_consistency_issue(
+    issue: ReportIssue,
+    *,
+    current_title_path: list[Any],
+    ref_full_paths: list[str],
+) -> None:
+    """将章节展示为完整标题路径（如 一、… > 1.…），并尽量把对照章节解析为模板中的完整路径。"""
+    related = issue.related if isinstance(issue.related, dict) else {}
+    parts = [str(x).strip() for x in current_title_path if str(x).strip()]
+    cur_full = " > ".join(parts)
+    if cur_full:
+        related["chapter_a"] = cur_full
+    raw_b = str(related.get("chapter_b") or "").strip()
+    if raw_b and ref_full_paths:
+        if raw_b in ref_full_paths:
+            related["chapter_b"] = raw_b
+        else:
+            matched: str | None = None
+            for rp in ref_full_paths:
+                if not rp:
+                    continue
+                if raw_b in rp:
+                    matched = rp
+                    break
+                last_seg = rp.split(" > ")[-1].strip()
+                if last_seg and (raw_b == last_seg or last_seg.endswith(raw_b) or raw_b in last_seg):
+                    matched = rp
+                    break
+            if matched:
+                related["chapter_b"] = matched
+    issue.related = related
+
+
+def _context_prompt(
+    current_title: str,
+    current_text: str,
+    ref_blocks: list[tuple[str, str]],
+    consistency_prompt: str | None = None,
+) -> str:
+    parts = [f"当前章节：{current_title}\n---\n{current_text[:12000]}\n"]
+    for title, text in ref_blocks:
+        parts.append(f"对照章节：{title}\n---\n{text[:12000]}\n")
+    body = "\n".join(parts)
+    cp = (consistency_prompt or "").strip()
+    if cp:
+        cp = cp[:8000]
+        return (
+            body
+            + "\n【一致性校验提示词】\n"
+            + f"{cp}\n\n"
+            + "【审核逻辑】\n"
+            + "1. 严格依据【一致性校验提示词】界定比对重点与判定标准；不得凭空增设其中未涉及的无关检查项。\n"
+            + "2. 在当前章节与对照章节之间进行交叉核对。\n"
+            + "3. 输出 JSON：issues 中说明哪两章不一致及原因；related 含 chapter_a、chapter_b，"
+            + "chapter_a 与 chapter_b 必须使用与上文「当前章节」「对照章节」标题行一致的完整层级路径，"
+            + "多级标题用「 > 」连接（例如：一、工程概况 > 1.模板支撑体系工程概况和特点），"
+            + "并给出可执行整改建议（suggestions: string[]，可选 suggestion: string）。"
+        )
+    return (
+        body
+        + "\n请检查上述章节在数据、结论、术语、前后要求等方面是否一致。输出 JSON，"
+        "issues 中说明哪两章不一致及原因，"
+        "related 含 chapter_a、chapter_b（均须为完整层级路径，多级用「 > 」连接，与上文章节标题行一致），"
+        "并补充可执行整改建议（suggestions: string[]，可选 suggestion: string）。"
+    )
+
+
+def _content_prompt(
+    current_text: str,
+    ref_text: str,
+    kb_text: str,
+    review_prompt: str,
+) -> str:
+    return (
+        "【当前章节及子节正文】\n"
+        f"{current_text[:16000]}\n\n"
+        "【引用章节正文】\n"
+        f"{ref_text[:12000] or '(无)'}\n\n"
+        "【知识库检索片段】\n"
+        f"{kb_text[:12000] or '(无)'}\n\n"
+        "【审核提示词】\n"
+        f"{review_prompt}\n\n"
+        "【审核逻辑】\n"
+        "1. 严格依据【审核提示词】提取核查项，不得自行新增无关检查项。\n"
+        "2. 逐项核查【当前章节及子节正文】；若缺失关键信息，明确指出缺失项。\n"
+        "3. 使用【引用章节正文】与【知识库检索片段】做交叉验证与依据补充。\n"
+        "4. 若正文出现“图如下/见下图/附图/组织机构图如下”等图示指示语，必须检查其后是否紧随至少一行“[附图] 对象键”。\n"
+        "5. 如图示指示语后缺少“[附图]”行，必须输出问题并给出缺图证据。\n"
+        "6. 对值为“(无)”的输入块，不得臆测内容；如影响判断，请在 issues 中说明“证据不足/无法交叉验证”。\n"
+        "7. 仅输出 JSON 对象；issues 需同时说明问题、证据来源（当前章节/引用章节/知识库）及参考依据。\n"
+        "8. 每条 issue 的 related 中必须给出可执行整改建议（suggestions: string[]，可选 suggestion: string）。"
+    )
+
+
+def _full_document_prompt(
+    doc_text: str,
+    kb_text: str,
+    review_prompt: str,
+    heading_catalog: str,
+) -> str:
+    return (
+        "【文档标题索引】\n"
+        "以下为待审文档全部标题及其段落索引（定位问题时须优先使用 heading_para_index，勿臆造）：\n"
+        f"{heading_catalog}\n\n"
+        "【待审文档全文】\n"
+        "标题行含 [hpi=N] 表示该标题在 Word 中的段落索引，与【文档标题索引】一致。\n"
+        f"{doc_text}\n\n"
+        "【知识库检索片段】\n"
+        f"{kb_text[:FULL_DOCUMENT_KB_CAP] or '(无)'}\n\n"
+        "【通篇审核提示词】\n"
+        f"{review_prompt}\n\n"
+        "【审核逻辑】\n"
+        "1. 严格依据【通篇审核提示词】提取核查项，不得自行新增无关检查项。\n"
+        "2. 在【待审文档全文】中逐项核查；结合【知识库检索片段】做交叉验证。\n"
+        "3. 每条可定位到具体章节的问题，anchor 必须包含 heading_para_index（取自索引或正文 [hpi=N]）"
+        "及 title_path（字符串数组，每级标题一项，须与索引中该 hpi 的完整路径一致）。\n"
+        "4. 若正文出现图示指示语，检查其后是否有“[附图]”行；缺图须输出问题。\n"
+        "5. 对值为“(无)”的输入块不得臆测；证据不足时在 issues 中说明。\n"
+        "6. 仅输出 JSON；issues 需含 message、evidence、anchor、related.suggestions（string[]）。\n"
+        "7. anchor 输出示例：\n"
+        '{"heading_para_index": 128, "title_path": ["六、施工管理及作业人员配备和分工", "4.其他作业人员"]}'
+    )
+
+
+def _extract_title_path_from_issue(issue: ReportIssue) -> list[str]:
+    anchor = issue.anchor if isinstance(issue.anchor, dict) else {}
+    path = parse_title_path_value(anchor.get("title_path"))
+    if path:
+        return path
+
+    related = issue.related if isinstance(issue.related, dict) else {}
+    loc = related.get("location")
+    if isinstance(loc, str) and loc.strip():
+        path = parse_title_path_value(loc)
+        if path:
+            return path
+    if isinstance(loc, dict):
+        path = parse_title_path_value(loc.get("chapter_path"))
+        if path:
+            return path
+        path = parse_title_path_value(loc.get("chapter_text"))
+        if path:
+            return path
+
+    for key in ("chapter", "chapter_a", "chapter_text", "title_path"):
+        path = parse_title_path_value(related.get(key))
+        if path:
+            return path
+
+    for text in (str(issue.message or ""), str(issue.evidence or "")):
+        for line in text.split("\n"):
+            if re.search(r"\s*[>＞]\s*", line):
+                path = parse_title_path_value(line)
+                if path:
+                    return path
+    return []
+
+
+def _extract_hpi_from_issue(issue: ReportIssue) -> int | None:
+    anchor = issue.anchor if isinstance(issue.anchor, dict) else {}
+    hpi = _coerce_int_hpi(anchor.get("heading_para_index"))
+    if hpi is not None:
+        return hpi
+
+    related = issue.related if isinstance(issue.related, dict) else {}
+    loc = related.get("location")
+    if isinstance(loc, dict):
+        hpi = _coerce_int_hpi(loc.get("heading_para_index"))
+        if hpi is not None:
+            return hpi
+
+    for text in (str(issue.evidence or ""), str(issue.message or "")):
+        hpi = _extract_hpi_from_text(text)
+        if hpi is not None:
+            return hpi
+    return None
+
+
+def _write_full_document_location(
+    issue: ReportIssue,
+    *,
+    title_path: list[str],
+    heading_para_index: int | None,
+) -> None:
+    anchor = dict(issue.anchor) if isinstance(issue.anchor, dict) else {}
+    related = dict(issue.related) if isinstance(issue.related, dict) else {}
+
+    anchor["title_path"] = title_path
+    if heading_para_index is not None:
+        anchor["heading_para_index"] = heading_para_index
+    elif "heading_para_index" in anchor:
+        del anchor["heading_para_index"]
+
+    chapter_text = " > ".join(title_path)
+    related["location"] = {
+        "chapter_path": title_path,
+        "chapter_text": chapter_text,
+        "heading_para_index": heading_para_index,
+        "user_title": title_path[-1] if title_path else "",
+    }
+    issue.anchor = anchor
+    issue.related = related
+
+
+def _normalize_full_document_issue(
+    issue: ReportIssue,
+    heading_index: list[UserHeadingEntry],
+) -> None:
+    hpi = _extract_hpi_from_issue(issue)
+    path = _extract_title_path_from_issue(issue)
+    entry = resolve_heading_from_index(heading_index, hpi=hpi, title_path=path or None)
+
+    if entry is not None:
+        _write_full_document_location(
+            issue,
+            title_path=entry["title_path"],
+            heading_para_index=entry["heading_para_index"],
+        )
+        return
+
+    if path:
+        _write_full_document_location(issue, title_path=path, heading_para_index=hpi)
+        return
+
+    if hpi is not None:
+        by_hpi = {e["heading_para_index"]: e for e in heading_index}
+        if hpi in by_hpi:
+            e = by_hpi[hpi]
+            _write_full_document_location(
+                issue,
+                title_path=e["title_path"],
+                heading_para_index=e["heading_para_index"],
+            )
+
+
+def _load_full_document_config(tmpl: SchemeTemplate) -> FullDocumentReviewConfig | None:
+    raw = tmpl.full_document_review_config
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        return FullDocumentReviewConfig.model_validate(data)
+    except Exception:
+        return None
+
+
+def run_review_pipeline(task_id: int) -> None:
+    db = SessionLocal()
+    try:
+        task = (
+            db.query(SchemeReviewTask)
+            .options(joinedload(SchemeReviewTask.scheme_type))
+            .filter(SchemeReviewTask.id == task_id)
+            .first()
+        )
+        if task is None:
+            return
+
+        # External OCR/LLM workflows may legitimately run for many minutes.
+        # The stale threshold must be longer than the configured review
+        # timeout, otherwise a second worker can incorrectly fail a live task.
+        configured_timeout = get_review_timeout_seconds(db)
+        stale_minutes = max(20, int(configured_timeout / 60) + 10)
+        recovered = _recover_stale_processing_tasks(
+            db,
+            current_task_id=task_id,
+            stale_minutes=stale_minutes,
+        )
+        if recovered > 0:
+            task = db.get(SchemeReviewTask, task_id)
+            if task is None:
+                return
+            _append_log(db, task, "warning", f"已自动回收 {recovered} 个僵尸 processing 任务")
+            db.commit()
+
+        try:
+            db.execute(text(f"SET SESSION innodb_lock_wait_timeout = {LOCK_WAIT_TIMEOUT_SECONDS}"))
+        except Exception:
+            # Best-effort safety setting; ignore if backend does not support it.
+            pass
+
+        task.status = ReviewTaskStatus.processing
+        task.review_conclusion = ReviewConclusion.not_reviewed
+        task.completeness_status = CompletenessStatus.unavailable
+        task.error_message = None
+        task.review_stage = None
+        task.output_object_key = None
+        task.started_at = datetime.now(UTC)
+        task.finished_at = None
+        task.duration_ms = None
+        task.input_tokens = None
+        task.output_tokens = None
+        task.total_tokens = None
+        task.dify_workflow_run_id = None
+        task.dify_workflow_task_id = None
+        task.dify_workflow_status = None
+        task.dify_workflow_output_format = None
+        _append_log(db, task, "info", "任务开始处理")
+        db.commit()
+        _raise_if_cancel_requested(db, task)
+
+        scheme = task.scheme_type
+        if scheme is None:
+            raise ReviewConfigurationError("方案类型不存在")
+        if getattr(scheme, "lifecycle_status", "draft") != "published":
+            raise ReviewConfigurationError("方案类型未发布或已停用，禁止执行正式审核")
+        readiness = assess_scheme_readiness(db, scheme)
+        if not readiness.ready:
+            detail = "；".join(readiness.issues) or "方案类型尚未完成发布配置"
+            raise ReviewConfigurationError(
+                f"方案类型不可审核（{readiness.status}）：{detail}"
+            )
+
+        live_template = db.query(SchemeTemplate).filter(SchemeTemplate.scheme_type_id == task.scheme_type_id).first()
+        if live_template is None:
+            raise RuntimeError("模版不存在")
+        tmpl = resolve_task_template_snapshot(task, live_template)
+
+        if not tmpl.review_workflow or not tmpl.review_workflow.strip():
+            raise RuntimeError("模版未配置审核工作流")
+        wf = ReviewWorkflowData.model_validate(json.loads(tmpl.review_workflow))
+        active = [s for s in wf.steps if s not in ("start", "end")]
+
+        if not tmpl.parsed_structure or not tmpl.parsed_structure.strip():
+            raise RuntimeError("模版无解析结构")
+        tpl_tree = json.loads(tmpl.parsed_structure)
+        template_nodes = tpl_tree.get("nodes") or []
+        if not template_nodes:
+            raise RuntimeError("模版结构为空")
+
+        _append_log(db, task, "info", "从对象存储读取审核文件…")
+        db.commit()
+        raw = minio_storage.get_object_bytes(task.object_key)
+        image_result = extract_and_store_docx_images(
+            docx_bytes=raw,
+            source_object_key=task.object_key,
+        )
+        _append_log(
+            db,
+            task,
+            "info",
+            (
+                "文档图片处理完成: "
+                f"uploaded={image_result.uploaded_count}, "
+                f"failed={image_result.failed_count}, "
+                f"paragraphs_with_images={len(image_result.paragraph_image_keys)}"
+            ),
+        )
+        db.commit()
+        user_tree = parse_docx_to_tree_with_paddle(
+            raw,
+            paragraph_image_keys=image_result.paragraph_image_keys,
+            runtime=resolve_document_integration(db),
+        )
+        user_nodes = user_tree.get("nodes") or []
+        _raise_if_cancel_requested(db, task)
+
+        mapping, struct_raw = align_template_user_trees(template_nodes, user_nodes)
+        structure_step = _structure_issues_to_report(struct_raw)
+
+        provider = effective_default_provider(db)
+        prompt_debug_enabled = get_review_prompt_debug_enabled(db)
+        review_timeout_seconds = get_review_timeout_seconds(db)
+        compilation_basis_concurrency = get_compilation_basis_concurrency(db)
+        context_consistency_concurrency = get_context_consistency_concurrency(db)
+        content_concurrency = get_content_concurrency(db)
+        debug_prompts: list[dict[str, Any]] = []
+        report = ReviewReportV1(
+            steps=[structure_step],
+            model_provider=provider,
+        )
+        token_usage_total: TokenUsage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+
+        if "structure" in active and not structure_step.passed:
+            _append_log(
+                db,
+                task,
+                "warning",
+                "结构审核发现缺失章节；已记录业务问题，并继续执行其余可执行审核步骤",
+            )
+            db.commit()
+
+        category = scheme.category
+        name = scheme.name
+        task_workflow = resolve_task_workflow_snapshot(
+            db,
+            task,
+            scheme_category=category,
+            scheme_name=name,
+        )
+        basis_rows = (
+            db.query(BasisItem)
+            .filter(
+                (BasisItem.scheme_type_id == task.scheme_type_id)
+                | (
+                    (BasisItem.scheme_type_id.is_(None))
+                    & (BasisItem.scheme_category == category)
+                    & (BasisItem.scheme_name == name)
+                )
+            )
+            .order_by(BasisItem.id)
+            .all()
+        )
+
+        dify_url, dify_key = get_dify_url_and_key(db)
+
+        for step_id in active:
+            if step_id == "structure":
+                continue
+
+            _raise_if_cancel_requested(db, task)
+
+            task.review_stage = step_id
+            _append_log(db, task, "info", f"开始步骤: {step_id}")
+            db.commit()
+
+            if step_id == "compilation_basis":
+                merged = ReportStep(step_id=step_id, passed=True, summary="", issues=[])
+                basis_work: list[tuple[int, dict[str, Any], str]] = []
+                widx = 0
+                configured_basis_nodes = 0
+                for tn in iter_nodes(template_nodes):
+                    if not tn.get("compilation_basis_audit_enabled"):
+                        continue
+                    configured_basis_nodes += 1
+                    tid = str(tn.get("id") or "")
+                    un = resolve_user_node(mapping, tid)
+                    if un is None:
+                        continue
+                    full = collect_subtree_text(un)
+                    if not full.strip():
+                        continue
+                    tp = title_path_for_node(template_nodes, tid)
+                    hpi = un.get("heading_para_index")
+                    anchor = {
+                        "template_node_id": tid,
+                        "title_path": tp,
+                        "heading_para_index": hpi,
+                    }
+                    prompt = _basis_prompt(full, basis_rows)
+                    basis_work.append((widx, anchor, prompt))
+                    widx += 1
+
+                if configured_basis_nodes < 1:
+                    raise ReviewConfigurationError("编制依据审核没有配置任何模板节点")
+                if not basis_work:
+                    merged.passed = False
+                    merged.summary = "编制依据章节缺失或为空，无法执行该步骤"
+                    report.steps.append(merged)
+                    continue
+
+                def _basis_run(payload: tuple[dict[str, Any], str]) -> Any:
+                    anchor_b, pr = payload
+                    ldb = SessionLocal()
+                    try:
+                        return _llm_review_execute(
+                            ldb,
+                            step_id=step_id,
+                            user_prompt=pr,
+                            anchor_base=anchor_b,
+                            collect_debug=prompt_debug_enabled,
+                            timeout_seconds=120.0,
+                            timeout_fail_fast=False,
+                        )
+                    finally:
+                        ldb.close()
+
+                basis_results = _bounded_parallel_map(
+                    concurrency=compilation_basis_concurrency,
+                    items=[(i, (a, p)) for i, a, p in basis_work],
+                    worker=_basis_run,
+                )
+                basis_results.sort(key=lambda x: x[0])
+                for _, pack in basis_results:
+                    sub, usage, log_lines, dbg = pack
+                    for level, msg in log_lines:
+                        _append_log(db, task, level, msg)
+                    if dbg is not None and debug_prompts is not None:
+                        debug_prompts.append(dbg)
+                    _merge_usage(token_usage_total, usage)
+                    _write_usage_snapshot(task, token_usage_total)
+                    for issue in sub.issues:
+                        # Do not turn an infrastructure/LLM failure into a fake
+                        # business finding such as ``现行缺失``.
+                        if not bool((issue.related or {}).get("technical_error")):
+                            _normalize_basis_issue_related(issue)
+                    merged.issues.extend(sub.issues)
+                    if not sub.passed:
+                        merged.passed = False
+                merged.summary = (
+                    "编制依据审核通过" if merged.passed else f"发现 {len(merged.issues)} 条编制依据相关问题"
+                )
+                report.steps.append(merged)
+
+            elif step_id == "context_consistency":
+                merged = ReportStep(step_id=step_id, passed=True, summary="", issues=[])
+                ctx_work: list[tuple[int, dict[str, Any], str, list[str]]] = []
+                cidx = 0
+                configured_context_nodes = 0
+                for tn in iter_nodes(template_nodes):
+                    refs = tn.get("context_consistency_ref_node_ids") or []
+                    if not isinstance(refs, list) or not refs:
+                        continue
+                    configured_context_nodes += 1
+                    tid = str(tn.get("id") or "")
+                    un = resolve_user_node(mapping, tid)
+                    if un is None:
+                        continue
+                    cur_title = str(tn.get("title") or "")
+                    cur_text = collect_subtree_text(un)
+                    ref_blocks: list[tuple[str, str]] = []
+                    for rid in refs:
+                        rid_s = str(rid)
+                        ru = resolve_user_node(mapping, rid_s)
+                        if ru is None:
+                            continue
+                        rt = title_path_for_node(template_nodes, rid_s)
+                        ref_blocks.append((title_path_str(rt), collect_subtree_text(ru)))
+                    if not ref_blocks:
+                        continue
+                    tp = title_path_for_node(template_nodes, tid)
+                    hpi = un.get("heading_para_index")
+                    anchor = {
+                        "template_node_id": tid,
+                        "title_path": tp,
+                        "heading_para_index": hpi,
+                    }
+                    raw_cp = tn.get("context_consistency_prompt")
+                    cp = raw_cp.strip() if isinstance(raw_cp, str) else ""
+                    prompt = _context_prompt(cur_title, cur_text, ref_blocks, cp or None)
+                    ref_path_strings = [str(rb[0]).strip() for rb in ref_blocks if str(rb[0]).strip()]
+                    ctx_work.append((cidx, anchor, prompt, ref_path_strings))
+                    cidx += 1
+
+                if configured_context_nodes < 1:
+                    raise ReviewConfigurationError("上下文一致性审核没有配置章节对照关系")
+                if not ctx_work:
+                    merged.passed = False
+                    merged.summary = "待比对章节缺失，无法执行上下文一致性审核"
+                    report.steps.append(merged)
+                    continue
+
+                def _ctx_run(payload: tuple[dict[str, Any], str]) -> Any:
+                    anchor_b, pr = payload
+                    ldb = SessionLocal()
+                    try:
+                        return _llm_review_execute(
+                            ldb,
+                            step_id=step_id,
+                            user_prompt=pr,
+                            anchor_base=anchor_b,
+                            collect_debug=prompt_debug_enabled,
+                            timeout_seconds=120.0,
+                            timeout_fail_fast=False,
+                        )
+                    finally:
+                        ldb.close()
+
+                ctx_results = _bounded_parallel_map(
+                    concurrency=context_consistency_concurrency,
+                    items=[(i, (a, p)) for i, a, p, _rfs in ctx_work],
+                    worker=_ctx_run,
+                )
+                ctx_results.sort(key=lambda x: x[0])
+                for i, (_, pack) in enumerate(ctx_results):
+                    sub, usage, log_lines, dbg = pack
+                    for level, msg in log_lines:
+                        _append_log(db, task, level, msg)
+                    if dbg is not None and debug_prompts is not None:
+                        debug_prompts.append(dbg)
+                    _merge_usage(token_usage_total, usage)
+                    _write_usage_snapshot(task, token_usage_total)
+                    _anchor = ctx_work[i][1]
+                    _ref_paths = ctx_work[i][3]
+                    _tp = _anchor.get("title_path") if isinstance(_anchor.get("title_path"), list) else []
+                    for issue in sub.issues:
+                        if not bool((issue.related or {}).get("technical_error")):
+                            _normalize_context_consistency_issue(
+                                issue,
+                                current_title_path=_tp,
+                                ref_full_paths=_ref_paths,
+                            )
+                    merged.issues.extend(sub.issues)
+                    if not sub.passed:
+                        merged.passed = False
+                merged.summary = (
+                    "上下文一致性审核通过" if merged.passed else f"发现 {len(merged.issues)} 条一致性问题"
+                )
+                report.steps.append(merged)
+
+            elif step_id == "content":
+                merged = ReportStep(step_id=step_id, passed=True, summary="", issues=[])
+                content_nodes: list[dict[str, Any]] = []
+                configured_content_nodes = 0
+                for tn in iter_nodes(template_nodes):
+                    rp = (tn.get("review_prompt") or "").strip() if isinstance(tn.get("review_prompt"), str) else ""
+                    if not rp:
+                        continue
+                    configured_content_nodes += 1
+                    tid = str(tn.get("id") or "")
+                    un = resolve_user_node(mapping, tid)
+                    if un is None:
+                        continue
+                    content_nodes.append(tn)
+
+                if configured_content_nodes < 1:
+                    raise ReviewConfigurationError("内容审核没有配置任何章节审核提示词")
+                if not content_nodes:
+                    merged.passed = False
+                    merged.summary = "已配置的内容审核章节均缺失，无法执行该步骤"
+                    report.steps.append(merged)
+                    continue
+
+                _append_log(
+                    db,
+                    task,
+                    "info",
+                    f"内容审核节点数: {len(content_nodes)}，超时阈值: {review_timeout_seconds} 秒",
+                )
+                db.commit()
+
+                content_items = [
+                    (
+                        i,
+                        (
+                            i,
+                            tn,
+                            template_nodes,
+                            mapping,
+                            dify_url,
+                            dify_key,
+                            review_timeout_seconds,
+                            prompt_debug_enabled,
+                            step_id,
+                            len(content_nodes),
+                        ),
+                    )
+                    for i, tn in enumerate(content_nodes)
+                ]
+                content_results = _bounded_parallel_map(
+                    concurrency=content_concurrency,
+                    items=content_items,
+                    worker=_content_node_worker,
+                )
+                content_results.sort(key=lambda x: x[0])
+                for _, pack in content_results:
+                    _wi, sub, usage, logs, dbg = pack
+                    pending_after_tokens: list[tuple[str, str]] = []
+                    for level, msg in logs:
+                        if "{tokens_placeholder}" in msg:
+                            pending_after_tokens.append((level, msg))
+                        else:
+                            _append_log(db, task, level, msg)
+                    _merge_usage(token_usage_total, usage)
+                    _write_usage_snapshot(task, token_usage_total)
+                    for level, msg in pending_after_tokens:
+                        msg_out = msg.replace("{tokens_placeholder}", str(task.total_tokens or 0))
+                        _append_log(db, task, level, msg_out)
+                    if dbg is not None and debug_prompts is not None:
+                        debug_prompts.append(dbg)
+                    merged.issues.extend(sub.issues)
+                    if not sub.passed:
+                        merged.passed = False
+                    db.commit()
+                merged.summary = (
+                    "内容审核完成" if merged.passed else f"发现 {len(merged.issues)} 条内容问题"
+                )
+                report.steps.append(merged)
+
+            elif step_id == "full_document":
+                fd_config = _load_full_document_config(tmpl)
+                rp = (fd_config.review_prompt or "").strip() if fd_config else ""
+                if not rp:
+                    raise ReviewConfigurationError("通篇审核已启用但未配置提示词")
+                else:
+                    heading_index = build_user_heading_index(user_nodes)
+                    catalog_text, catalog_truncated = format_heading_catalog(
+                        heading_index,
+                        max_entries=FULL_DOCUMENT_HEADING_CATALOG_MAX,
+                    )
+                    if catalog_truncated:
+                        _append_log(
+                            db,
+                            task,
+                            "warning",
+                            f"通篇审核标题索引已截断至 {FULL_DOCUMENT_HEADING_CATALOG_MAX} 条",
+                        )
+                    full_raw = collect_full_document_text(user_nodes)
+                    doc_text = full_raw
+                    if len(full_raw) > FULL_DOCUMENT_TEXT_CAP:
+                        doc_text = full_raw[:FULL_DOCUMENT_TEXT_CAP]
+                        _append_log(
+                            db,
+                            task,
+                            "warning",
+                            f"通篇审核文档正文已截断至 {FULL_DOCUMENT_TEXT_CAP} 字符（原文 {len(full_raw)} 字符）",
+                        )
+                    kb_text = ""
+                    kb_degraded_message = ""
+                    ds = fd_config.dify_dataset_id if fd_config else None
+                    if ds and dify_url and dify_key:
+                        kws = fd_config.knowledge_keywords if fd_config else []
+                        qparts: list[str] = []
+                        if isinstance(kws, list):
+                            qparts.extend(str(x).strip() for x in kws if str(x).strip())
+                        if not qparts:
+                            qparts.append(name or category or "方案审核")
+                        query = " ".join(qparts)[:250]
+                        try:
+                            kb_text = retrieve_dataset_chunks(
+                                dify_url, dify_key, str(ds), query
+                            )
+                        except Exception as e:
+                            kb_degraded_message = (
+                                f"dataset={ds}; {type(e).__name__}: {e!s}"
+                            )[:1000]
+                            _append_log(
+                                db,
+                                task,
+                                "warning",
+                                f"通篇审核知识库检索跳过 dataset={ds}: {e!s}",
+                            )
+                    prompt = _full_document_prompt(
+                        doc_text, kb_text, rp, catalog_text
+                    )
+                    fd_timeout = float(max(180, review_timeout_seconds))
+                    sub, usage, log_lines, dbg = _llm_review_execute(
+                        db,
+                        step_id=step_id,
+                        user_prompt=prompt,
+                        anchor_base={},
+                        collect_debug=prompt_debug_enabled,
+                        timeout_seconds=fd_timeout,
+                        timeout_fail_fast=False,
+                        system=FULL_DOCUMENT_JSON_SYSTEM,
+                    )
+                    if kb_degraded_message:
+                        sub.issues.append(
+                            ReportIssue(
+                                severity="warning",
+                                message="法规知识库检索未完成，通篇审核结果不完整",
+                                evidence=kb_degraded_message,
+                                related={
+                                    "technical_error": True,
+                                    "component": "dify_dataset",
+                                    "integration_error": True,
+                                    "completeness_impact": "partial",
+                                },
+                            )
+                        )
+                        sub.passed = False
+                    for level, msg in log_lines:
+                        _append_log(db, task, level, msg)
+                    _merge_usage(token_usage_total, usage)
+                    _write_usage_snapshot(task, token_usage_total)
+                    if dbg is not None and debug_prompts is not None:
+                        debug_prompts.append(dbg)
+                    unlocated = 0
+                    for issue in sub.issues:
+                        if not bool((issue.related or {}).get("technical_error")):
+                            _normalize_full_document_issue(issue, heading_index)
+                        loc = (issue.related or {}).get("location") if isinstance(issue.related, dict) else None
+                        chapter_text = ""
+                        if isinstance(loc, dict):
+                            chapter_text = str(loc.get("chapter_text") or "").strip()
+                        if not chapter_text:
+                            unlocated += 1
+                    if sub.issues:
+                        _append_log(
+                            db,
+                            task,
+                            "info",
+                            f"通篇审核定位：{len(sub.issues) - unlocated}/{len(sub.issues)} 条已解析章节路径",
+                        )
+                    sub.summary = sub.summary or (
+                        "通篇审核通过" if sub.passed else f"发现 {len(sub.issues)} 条通篇问题"
+                    )
+                    report.steps.append(sub)
+                    db.commit()
+
+        workflow_settings = task_workflow.config
+        workflow_inputs = task_workflow.inputs
+        if workflow_settings.enabled:
+            _raise_if_cancel_requested(db, task)
+            task.review_stage = "dify_workflow"
+            _append_log(db, task, "info", "开始步骤: dify_workflow")
+            db.commit()
+            workflow_client = DifyWorkflowClient(
+                workflow_settings.base_url,
+                workflow_settings.api_key,
+                workflow_settings.timeout_seconds,
+                output_variable=workflow_settings.output_variable,
+                output_format=workflow_settings.output_format,
+                input_mapping=workflow_settings.input_mapping,
+            )
+            workflow_t0 = perf_counter()
+            try:
+                document_files: list[tuple[str, bytes]] = []
+                raw_documents = workflow_inputs.get("documents")
+                if isinstance(raw_documents, list):
+                    for item in raw_documents:
+                        if not isinstance(item, dict):
+                            continue
+                        key = str(item.get("object_key") or "").strip()
+                        filename = str(item.get("file_name") or "document").strip()
+                        if not key:
+                            continue
+                        content = raw if key == task.object_key else minio_storage.get_object_bytes(key)
+                        document_files.append((filename, content))
+                if not document_files:
+                    document_files = [(task.original_filename, raw)]
+                site_image_files: list[tuple[str, bytes]] = []
+                raw_images = workflow_inputs.get("site_images")
+                if isinstance(raw_images, list):
+                    for item in raw_images:
+                        if not isinstance(item, dict):
+                            continue
+                        key = str(item.get("object_key") or "").strip()
+                        if key:
+                            site_image_files.append(
+                                (
+                                    str(item.get("file_name") or "site-image"),
+                                    minio_storage.get_object_bytes(key),
+                                )
+                            )
+                workflow_result = workflow_client.run_review(
+                    file_name=task.original_filename,
+                    file_content=raw,
+                    project_name=str(workflow_inputs.get("project_name") or "").strip()
+                    or f"审查任务-{task.id}",
+                    project_region=str(workflow_inputs.get("project_region") or "").strip(),
+                    risk_type=str(workflow_inputs.get("risk_type") or "").strip()
+                    or " / ".join(x for x in (category, name) if x),
+                    review_focus=str(workflow_inputs.get("review_focus") or "").strip(),
+                    user=f"{workflow_settings.user_prefix}-{task.id}",
+                    document_files=document_files,
+                    site_image_files=site_image_files,
+                )
+                _raise_if_cancel_requested(db, task)
+                task.dify_workflow_run_id = workflow_result.workflow_run_id or None
+                task.dify_workflow_task_id = workflow_result.task_id or None
+                task.dify_workflow_status = workflow_result.status
+                task.dify_workflow_output_format = workflow_result.output_format
+                if (
+                    workflow_result.status == "partial-succeeded"
+                    and not workflow_settings.accept_partial
+                ):
+                    raise DifyWorkflowError(
+                        "Dify Workflow returned partial-succeeded, which is disabled."
+                    )
+                workflow_step = dify_report_to_step(
+                    workflow_result.report,
+                    output_format=workflow_result.output_format,
+                )
+                if workflow_result.status == "partial-succeeded":
+                    workflow_step.passed = False
+                    workflow_step.summary = (
+                        "Dify Workflow 部分成功：报告已保留，但内部至少一个节点异常，"
+                        "需结合 Dify 运行日志复核。\n" + workflow_step.summary
+                    )
+                    workflow_step.issues.append(
+                        ReportIssue(
+                            severity="warning",
+                            message="Dify Workflow 为部分成功，存在内部节点异常",
+                            evidence=(
+                                f"workflow_run_id={workflow_result.workflow_run_id or '-'}; "
+                                "status=partial-succeeded"
+                            ),
+                            related={
+                                "technical_error": True,
+                                "component": "dify_workflow",
+                                "integration_warning": True,
+                                "completeness_impact": "partial",
+                            },
+                        )
+                    )
+                report.steps.append(workflow_step)
+                extracted_parameter_count = _persist_dify_parameter_candidates(
+                    db,
+                    task,
+                    workflow_result.report,
+                )
+                if extracted_parameter_count:
+                    _append_log(
+                        db,
+                        task,
+                        "info",
+                        f"Dify 提取 {extracted_parameter_count} 个候选参数，待专家核验后形成正式证据",
+                    )
+                elapsed_ms = int((perf_counter() - workflow_t0) * 1000)
+                _append_log(
+                    db,
+                    task,
+                    "info",
+                    (
+                        "Dify Workflow 审查完成 "
+                        f"status={workflow_result.status} "
+                        f"run_id={workflow_result.workflow_run_id or '-'} "
+                        f"task_id={workflow_result.task_id or '-'} 用时={elapsed_ms}ms"
+                    ),
+                )
+            except DifyWorkflowError as exc:
+                task.dify_workflow_run_id = getattr(exc, "workflow_run_id", "") or None
+                task.dify_workflow_task_id = getattr(exc, "task_id", "") or None
+                task.dify_workflow_status = getattr(exc, "status", "") or "failed"
+                task.dify_workflow_output_format = (
+                    getattr(exc, "output_format", "") or workflow_settings.output_format
+                )
+                elapsed_ms = int((perf_counter() - workflow_t0) * 1000)
+                message = f"Dify Workflow 未完成：{exc!s}"
+                _append_log(db, task, "warning", f"{message} 用时={elapsed_ms}ms")
+                report.steps.append(
+                    ReportStep(
+                        step_id="dify_workflow",
+                        passed=False,
+                        summary=message,
+                        issues=[
+                            ReportIssue(
+                                severity="warning",
+                                message="Dify Workflow 服务未完成本次全文审查",
+                                evidence=str(exc)[:2000],
+                                related={
+                                    "technical_error": True,
+                                    "component": "dify_workflow",
+                                    "integration_error": True,
+                                    "completeness_impact": "partial",
+                                },
+                            )
+                        ],
+                    )
+                )
+                if not workflow_settings.continue_on_failure:
+                    raise
+            db.commit()
+
+        # Deterministic rules are deliberately executed after the semantic
+        # review stages.  The LLM may help extract candidate parameters, but
+        # final thresholds and arithmetic are evaluated by the safe rule
+        # engine and retained as reproducible calculation records.
+        task.review_stage = "rules_and_formulas"
+        _raise_if_cancel_requested(db, task)
+        deterministic_results = execute_rules_for_task(db, task)
+        if deterministic_results:
+            deterministic_issues: list[ReportIssue] = []
+            passed_count = 0
+            for result in deterministic_results:
+                rule = result.rule
+                related: dict[str, Any] = {
+                    "rule_id": rule.id,
+                    "rule_code": rule.rule_code,
+                    "rule_version": rule.version,
+                    "rule_type": rule.rule_type,
+                    "standard_no": rule.source_standard_no,
+                    "standard_name": rule.source_standard_name,
+                    "standard_version": rule.source_version,
+                    "clause_no": rule.source_clause,
+                    "clause_text": rule.source_text,
+                    "evidence_status": "verified",
+                    "formal_violation": True,
+                    "requires_human_judgement": False,
+                    "calculation_result_id": result.id,
+                    "inputs": json.loads(result.inputs_json or "{}"),
+                    "steps": json.loads(result.steps_json or "[]"),
+                    "expected": json.loads(result.expected_json or "{}"),
+                }
+                if result.error_message:
+                    related.update(
+                        {
+                            "technical_error": True,
+                            "component": "rule_engine",
+                            "completeness_impact": "unavailable",
+                        }
+                    )
+                    deterministic_issues.append(
+                        ReportIssue(
+                            severity="error",
+                            message=f"确定性规则无法完成：{rule.name}",
+                            evidence=result.error_message,
+                            related=related,
+                        )
+                    )
+                elif not result.passed:
+                    deterministic_issues.append(
+                        ReportIssue(
+                            severity=(
+                                rule.severity
+                                if rule.severity in ("error", "warning", "info")
+                                else "error"
+                            ),
+                            message=result.message or f"不符合规则：{rule.name}",
+                            evidence=(
+                                f"{rule.source_standard_no} {rule.source_clause}："
+                                f"{rule.source_text}"
+                            ).strip(),
+                            related=related,
+                        )
+                    )
+                else:
+                    passed_count += 1
+            report.steps.append(
+                ReportStep(
+                    step_id="rules_and_formulas",
+                    passed=not deterministic_issues,
+                    summary=(
+                        f"确定性校验 {len(deterministic_results)} 项，"
+                        f"通过 {passed_count} 项，待处理 {len(deterministic_issues)} 项"
+                    ),
+                    issues=deterministic_issues,
+                )
+            )
+            _append_log(
+                db,
+                task,
+                "info",
+                (
+                    f"规则与公式验算完成：total={len(deterministic_results)}, "
+                    f"passed={passed_count}, issues={len(deterministic_issues)}"
+                ),
+            )
+            db.commit()
+
+        task.review_stage = None
+        _append_log(db, task, "info", "审核步骤结束，开始生成审核报告")
+        db.commit()
+        _classify_issue_evidence(report)
+        task.review_result_json = _review_result_to_json(
+            report,
+            debug_prompts=debug_prompts if prompt_debug_enabled else None,
+        )
+        _append_log(db, task, "info", "审核报告 JSON 生成完成")
+        db.commit()
+
+        annotations: list[tuple[int, str]] = []
+        for st in report.steps:
+            for iss in st.issues:
+                hpi = (iss.anchor or {}).get("heading_para_index")
+                if isinstance(hpi, int):
+                    step_label = WORD_COMMENT_STEP_LABEL_CN.get(st.step_id, st.step_id)
+                    txt = f"({step_label}) {iss.message}"
+                    if iss.evidence:
+                        txt += f"\n{iss.evidence[:800]}"
+                    annotations.append((hpi, txt[:2000]))
+
+        _append_log(db, task, "info", f"收集批注完成，待写入批注数: {len(annotations)}")
+        db.commit()
+        _raise_if_cancel_requested(db, task)
+
+        out_bytes = raw
+        if annotations:
+            _append_log(db, task, "info", "开始写入 Word 批注")
+            db.commit()
+            comments_t0 = perf_counter()
+            try:
+                out_bytes = inject_comments_at_paragraphs(raw, annotations)
+            except Exception as e:
+                _append_log(db, task, "warning", f"写入 Word 批注失败，已保留原文: {e!s}")
+            finally:
+                comments_elapsed_ms = int((perf_counter() - comments_t0) * 1000)
+                _append_log(db, task, "info", f"Word 批注阶段完成，用时={comments_elapsed_ms}ms")
+                db.commit()
+        else:
+            _append_log(db, task, "info", "无可写入批注，跳过 Word 批注阶段")
+            db.commit()
+
+        _raise_if_cancel_requested(db, task)
+        out_key = f"reviews/{task.scheme_type_id}/{uuid.uuid4().hex}_annotated.docx"
+        _append_log(
+            db,
+            task,
+            "info",
+            f"开始上传审核结果文档（超时阈值: {review_timeout_seconds} 秒）",
+        )
+        db.commit()
+        upload_t0 = perf_counter()
+        minio_storage.put_object_with_hard_timeout(
+            out_key,
+            out_bytes,
+            length=len(out_bytes),
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            timeout_seconds=float(review_timeout_seconds),
+            hard_timeout_seconds=float(review_timeout_seconds) + 8.0,
+        )
+        upload_elapsed_ms = int((perf_counter() - upload_t0) * 1000)
+        task.output_object_key = out_key
+        record_document_artifact(
+            db,
+            task_id=task.id,
+            artifact_kind="ai_annotated",
+            object_key=out_key,
+            content=out_bytes,
+            minio_bucket=task.minio_bucket,
+            original_filename=(
+                re.sub(r"\.docx$", "", task.original_filename, flags=re.IGNORECASE)
+                + "_AI批注版.docx"
+            ),
+            created_by_id=None,
+        )
+        _append_log(db, task, "info", f"上传审核结果文档完成，用时={upload_elapsed_ms}ms")
+
+        _append_log(db, task, "info", "开始写入最终任务状态")
+        conclusion, completeness = _derive_task_outcome(report)
+        task.review_conclusion = conclusion
+        task.completeness_status = completeness
+        task.status = (
+            ReviewTaskStatus.failed
+            if completeness == CompletenessStatus.unavailable
+            else ReviewTaskStatus.succeeded
+        )
+        _write_usage_snapshot(task, token_usage_total)
+        _finalize_timing_and_tokens(task)
+        if completeness == CompletenessStatus.unavailable:
+            task.error_message = "至少一个必需审核步骤发生技术失败，审查结论不可用"
+            task.result_text = "审核未完整执行，请查看技术错误并重新发起审核。"
+            _append_log(db, task, "error", "任务处理结束，但必需审核步骤不可用")
+        elif completeness == CompletenessStatus.partial:
+            task.error_message = None
+            task.result_text = "审核已完成，但部分辅助服务未完成，请结合完整性状态复核。"
+            _append_log(db, task, "warning", "任务部分完成，已明确标记 completeness_status=partial")
+        elif conclusion == ReviewConclusion.passed:
+            task.error_message = None
+            task.result_text = "审核已完整执行，未发现待处理问题。"
+            _append_log(db, task, "info", "任务处理成功，审核完整通过")
+        else:
+            task.error_message = None
+            task.result_text = "审核已完整执行，存在待处理问题，请查看报告与批注。"
+            _append_log(db, task, "info", "任务处理成功，发现业务审核问题")
+        _ensure_expert_round(db, task)
+        try:
+            db.commit()
+        except OperationalError as e:
+            db.rollback()
+            err_text = f"最终状态提交失败（可能锁等待或连接超时）: {e!s}"
+            try:
+                recovery = db.get(SchemeReviewTask, task_id)
+                if recovery is None:
+                    raise TimeoutError(err_text)
+                _append_log(db, recovery, "error", err_text)
+                recovery.status = ReviewTaskStatus.failed
+                recovery.review_conclusion = ReviewConclusion.not_reviewed
+                recovery.completeness_status = CompletenessStatus.unavailable
+                recovery.review_stage = None
+                recovery.error_message = err_text
+                _finalize_timing_and_tokens(recovery)
+                _ensure_expert_round(db, recovery)
+                db.commit()
+            except Exception as recover_exc:
+                db.rollback()
+                raise TimeoutError(err_text) from recover_exc
+            return
+    except ReviewCancelled as e:
+        db.rollback()
+        try:
+            task = db.get(SchemeReviewTask, task_id)
+            if task is not None:
+                _append_log(db, task, "warning", str(e))
+                task.status = ReviewTaskStatus.canceled
+                task.review_conclusion = ReviewConclusion.not_reviewed
+                task.completeness_status = CompletenessStatus.unavailable
+                task.error_message = None
+                task.result_text = "任务已由用户取消，未形成审核结论。"
+                task.review_stage = None
+                task.output_object_key = None
+                _finalize_timing_and_tokens(task)
+                _ensure_expert_round(db, task)
+                db.commit()
+        except Exception:
+            db.rollback()
+    except TimeoutError as e:
+        db.rollback()
+        try:
+            task = db.get(SchemeReviewTask, task_id)
+            if task is not None:
+                err_text = str(e)
+                _append_log(db, task, "error", f"处理超时并已终止: {err_text}")
+                task.status = ReviewTaskStatus.failed
+                task.review_conclusion = ReviewConclusion.not_reviewed
+                task.completeness_status = CompletenessStatus.unavailable
+                task.error_message = err_text
+                task.review_stage = None
+                _finalize_timing_and_tokens(task)
+                _ensure_expert_round(db, task)
+                db.commit()
+        except Exception:
+            db.rollback()
+    except Exception as e:
+        db.rollback()
+        try:
+            task = db.get(SchemeReviewTask, task_id)
+            if task is not None:
+                err_text = str(e)
+                tb = traceback.format_exc()
+                _append_log(db, task, "error", f"处理失败: {err_text}")
+                _append_log(db, task, "error", f"异常堆栈:\n{tb}")
+                task.status = ReviewTaskStatus.failed
+                task.review_conclusion = ReviewConclusion.not_reviewed
+                task.completeness_status = CompletenessStatus.unavailable
+                task.error_message = err_text
+                task.review_stage = None
+                _finalize_timing_and_tokens(task)
+                _ensure_expert_round(db, task)
+                db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()

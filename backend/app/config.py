@@ -1,44 +1,104 @@
 from functools import lru_cache
+from pathlib import Path
 
-from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Load .env from fixed paths so `alembic` (cwd=backend/) still sees repo-root `.env`.
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_ROOT_DIR = _BACKEND_DIR.parent
+
+_ENV_FILES = tuple(
+    p
+    for p in (_ROOT_DIR / ".env", _BACKEND_DIR / ".env")
+    if p.is_file()
+)
 
 
 class Settings(BaseSettings):
-    """Runtime settings loaded from environment variables."""
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILES if _ENV_FILES else None,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    mysql_user: str = "root"
+    mysql_password: str = "change-me-in-env"
+    mysql_host: str = "127.0.0.1"
+    mysql_port: int = 3306
+    mysql_db: str = "review"
 
-    app_name: str = "危大工程智审系统"
-    api_v1_prefix: str = "/api/v1"
-    debug: bool = True
-    secret_key: str = Field(default="dev-secret-key-change-in-production")
+    jwt_secret: str = "change-me-in-env"
+    settings_encryption_key: str = ""
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60 * 24
 
-    postgres_url: str = "postgresql://user:pass@localhost:5432/smart_review"
-    milvus_host: str = "localhost"
-    milvus_port: int = 19530
-    redis_url: str = "redis://localhost:6379/0"
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
-    vllm_base_url: str = "http://localhost:8000/v1"
-    vllm_model_name: str = "Qwen/Qwen3-30B-A3B"
-    vllm_api_key: str = "not-needed-for-local"
-    bge_m3_model_path: str = "./models/bge-m3"
+    minio_endpoint: str = "127.0.0.1:9000"
+    minio_access_key: str = "minioadmin"
+    minio_secret_key: str = "change-me-in-env"
+    minio_bucket: str = "review"
+    minio_secure: bool = False
 
-    max_parse_timeout_seconds: int = 300
-    max_review_timeout_seconds: int = 600
+    # Optional ClamAV upload scanning. Production should enable fail-closed mode.
+    clamav_host: str = ""
+    clamav_port: int = 3310
+    clamav_timeout_seconds: float = 30.0
+    malware_scan_required: bool = False
 
-    @field_validator("debug", mode="before")
-    @classmethod
-    def parse_debug_flag(cls, value: object) -> object:
-        """Accept common deployment words in DEBUG-like environments."""
+    admin_bootstrap: bool = False
+    admin_username: str = ""
+    admin_password: str = ""
+    admin_phone: str = "00000000000"
 
-        if isinstance(value, str) and value.lower() in {"release", "prod", "production"}:
-            return False
-        return value
+    # Dify 知识库（可通过环境变量预置；管理员也可在「设置」中覆盖写入数据库）
+    dify_base_url: str = ""
+    dify_api_key: str = ""
+
+    # Dify Workflow application. Its app-* key is different from Dataset API keys.
+    dify_workflow_enabled: bool = False
+    dify_workflow_base_url: str = ""
+    dify_workflow_api_key: str = ""
+    dify_workflow_user_prefix: str = "smart-review"
+    dify_workflow_timeout_seconds: int = 900
+
+    # PaddleOCR PP-StructureV3 basic serving endpoint.
+    paddleocr_api_url: str = "http://127.0.0.1:8080/layout-parsing"
+    paddleocr_api_key: str = ""
+    paddleocr_timeout_seconds: float = 600.0
+    paddle_convert_timeout_seconds: float = 180.0
+    libreoffice_bin: str = ""
+
+    # 大模型（可选；数据库「设置」优先覆盖非空字段）
+    default_llm_provider: str = ""
+    volcengine_base_url: str = ""
+    volcengine_api_key: str = ""
+    volcengine_endpoint_id: str = ""
+    minimax_base_url: str = ""
+    minimax_api_key: str = ""
+    minimax_model: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_api_key: str = ""
+    deepseek_model: str = "deepseek-v4-flash"
+
+    # OnlyOffice（可在「设置」中覆盖；此处为未配置界面时的兜底）
+    onlyoffice_docs_url: str = ""
+    onlyoffice_jwt_secret: str = ""
+    onlyoffice_callback_base_url: str = ""
+    onlyoffice_editor_lang: str = "zh"
+
+    @property
+    def database_url(self) -> str:
+        return (
+            f"mysql+pymysql://{self.mysql_user}:{self.mysql_password}"
+            f"@{self.mysql_host}:{self.mysql_port}/{self.mysql_db}"
+        )
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
 
 @lru_cache
 def get_settings() -> Settings:
-    """Return cached application settings."""
-
     return Settings()

@@ -1,60 +1,130 @@
-name: CI
+name: SmartReview CI
 
 on:
   push:
-    branches: [develop, main]
   pull_request:
-    branches: [develop, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smartreview-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint-type-test:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install uv
-        run: pip install uv
-
-      - name: Install dependencies
-        run: uv sync --all-extras
-
-      - name: Lint
-        run: uv run ruff check app tests
-
-      - name: Format check
-        run: uv run ruff format --check app tests
-
-      - name: Type check
-        run: uv run mypy app
-
-      - name: Test
-        run: uv run pytest tests -v --cov=app --cov-report=term-missing
-
-  frontend-build:
+  frontend:
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: frontend
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v4
         with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
       - name: Install dependencies
-        run: npm install
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm lint
+      - name: TypeScript and production build
+        run: pnpm build
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Demo browser E2E
+        run: pnpm test:e2e
+      - name: Upload Playwright diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-playwright-diagnostics
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
 
-      - name: Build
-        run: npm run build
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0.46
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-password
+          MYSQL_DATABASE: review
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-root-password --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ci-root-password
+      MYSQL_DB: review
+      JWT_SECRET: ci-jwt-secret-that-is-long-enough
+      MINIO_ENDPOINT: 127.0.0.1:9000
+      MINIO_ACCESS_KEY: ci-minio
+      MINIO_SECRET_KEY: ci-minio-secret
+      MINIO_BUCKET: review
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.16"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+      - name: Compile application
+        run: python -m compileall -q app
+      - name: Alembic upgrade smoke test
+        run: alembic upgrade head && alembic current
+      - name: Unit and contract tests
+        run: pytest -q
+
+  compose-validation:
+    runs-on: ubuntu-latest
+    env:
+      HOST_IP: 192.0.2.10
+      MYSQL_USER: smartreview
+      MYSQL_PASSWORD: ci-app-password
+      MYSQL_ROOT_PASSWORD: ci-root-password
+      MYSQL_DB: review
+      JWT_SECRET: ci-jwt-secret-that-is-long-enough
+      MINIO_ACCESS_KEY: ci-minio
+      MINIO_SECRET_KEY: ci-minio-secret
+      ONLYOFFICE_JWT_SECRET: ci-onlyoffice-secret
+      PUBLIC_HOSTNAME: review.example.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate demo Compose
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.paddle.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.paddle.yml config --format json > /tmp/demo-compose.json
+          test "$(jq -r '[.services | to_entries[] | select((.value.ports // []) | length > 0) | .key] | join(",")' /tmp/demo-compose.json)" = "frontend"
+          jq -e '[.services | to_entries[] | select(.key != "mysql-app-user" and .key != "minio-app-user") | select(.value.healthcheck == null)] | length == 0' /tmp/demo-compose.json
+          jq -e '[.services | to_entries[] | .value.image | select(endswith(":latest"))] | length == 0' /tmp/demo-compose.json
+      - name: Validate loopback admin overlay
+        run: docker compose -f docker-compose.yml -f docker-compose.paddle.yml -f docker-compose.admin.yml config --quiet
+      - name: Validate HTTPS production overlay
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.paddle.yml -f docker-compose.production.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.paddle.yml -f docker-compose.production.yml config --format json > /tmp/production-compose.json
+          test "$(jq -r '[.services | to_entries[] | select((.value.ports // []) | length > 0) | .key] | join(",")' /tmp/production-compose.json)" = "gateway"
+      - name: Validate malware-scanning overlay
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.paddle.yml -f docker-compose.security.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.paddle.yml -f docker-compose.security.yml config --format json > /tmp/security-compose.json
+          test "$(jq -r '[.services.clamav.ports // []] | flatten | length' /tmp/security-compose.json)" = "0"
+          test "$(jq -r '.services.backend.environment.MALWARE_SCAN_REQUIRED' /tmp/security-compose.json)" = "true"

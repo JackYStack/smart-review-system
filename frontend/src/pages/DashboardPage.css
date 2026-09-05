@@ -1,0 +1,251 @@
+/* 与 AppLayout 主内容区 #fafafa 协调；纵向滚动由 .app-outlet--scroll 承担，避免双滚动条 */
+.dashboard-wall {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 20px 24px 28px;
+  background: linear-gradient(180deg, #f5f7fa 0%, #fafafa 32%, #fafafa 100%);
+  color: rgba(0, 0, 0, 0.88);
+}
+
+.dashboard-wall__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.dashboard-wall__title {
+  font-weight: 600;
+  font-size: 16px;
+  color: rgba(0, 0, 0, 0.88);
+  letter-spacing: 0.02em;
+}
+
+.dashboard-wall__hint {
+  margin: 0 0 20px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(0, 0, 0, 0.55);
+}
+
+.dashboard-wall__section {
+  margin-bottom: 28px;
+}
+
+.dashboard-wall__section:last-of-type {
+  margin-bottom: 0;
+}
+
+.dashboard-wall__section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.dashboard-wall__section-icon {
+  font-size: 18px;
+  color: #1677ff;
+}
+
+.dashboard-wall__section-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.88);
+  letter-spacing: 0.02em;
+}
+
+.dashboard-wall__token-hero {
+  background: linear-gradient(145deg, #f0f7ff 0%, #ffffff 48%, #fafbff 100%);
+  border: 1px solid #d6e4ff;
+  border-radius: 12px;
+  box-shadow: 0 4px 14px rgba(22, 119, 255, 0.08);
+}
+
+.dashboard-wall__token-hero .ant-card-body {
+  padding: 20px 20px 22px;
+}
+
+.dashboard-wall__token-group {
+  padding: 4px 2px;
+  min-height: 108px;
+}
+
+.dashboard-wall__token-group-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.55);
+  margin-bottom: 8px;
+}
+
+.dashboard-wall__token-main {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: rgba(0, 0, 0, 0.88);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  margin-bottom: 8px;
+}
+
+.dashboard-wall__token-split {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  font-size: 13px;
+  color: rgba(0, 0, 0, 0.65);
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-wall__token-split-sep {
+  color: rgba(0, 0, 0, 0.2);
+  user-select: none;
+}
+
+.dashboard-wall .ant-card {
+  background: #fff;
+  border: 1px solid #f0f0f0;
+  border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+.dashboard-wall .ant-card-head {
+  border-bottom-color: #f0f0f0;
+  color: rgba(0, 0, 0, 0.88);
+  min-height: 44px;
+}
+
+.dashboard-wall .ant-card-head-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.88);
+}
+
+/* 指标名称：提高对比度（原暗色页过浅） */
+.dashboard-wall .ant-statistic-title {
+  color: rgba(0, 0, 0, 0.65);
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+
+.dashboard-wall .ant-statistic-content {
+  color: rgba(0, 0, 0, 0.88);
+  font-weight: 600;
+}
+
+.dashboard-wall .ant-statistic-content-suffix {
+  font-size: 15px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.55);
+  margin-inline-start: 4px;
+}
+
+/* KPI 行：同列卡片等高、同宽（Col 等分 + Card 撑满） */
+.dashboard-wall__kpi-cards-row.ant-row {
+  align-items: stretch;
+}
+
+.dashboard-wall__kpi-cards-row > .ant-col {
+  display: flex;
+}
+
+.dashboard-wall__kpi-card.ant-card {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.dashboard-wall__kpi-card .ant-card-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.dashboard-wall__chart {
+  min-height: 280px;
+}
+
+/* Dify：与其它 Statistic 相同「标题 + 一行主数字区」，双指标并排，避免卡片变高 */
+.dashboard-wall__dify-kpi {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.dashboard-wall__dify-kpi .ant-statistic {
+  flex: 1;
+}
+
+.dashboard-wall__dify-kpi .ant-statistic-content {
+  display: block;
+  min-width: 0;
+}
+
+.dashboard-wall__dify-inline-values {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  max-width: 100%;
+}
+
+.dashboard-wall__dify-metric {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: nowrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.dashboard-wall__dify-metric-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.45);
+}
+
+.dashboard-wall__dify-metric-num {
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: rgba(0, 0, 0, 0.88);
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-wall__dify-metric-unit {
+  font-size: 15px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.88);
+}
+
+.dashboard-wall__dify-metric-sep {
+  font-size: 14px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.25);
+  user-select: none;
+}
+
+.dashboard-wall__dify-warn {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(0, 0, 0, 0.55);
+}
+
+.dashboard-wall__dify-warn--emphasis {
+  color: #ad6800;
+}
+
+.dashboard-wall__empty {
+  padding: 48px;
+  text-align: center;
+  color: rgba(0, 0, 0, 0.45);
+  font-size: 14px;
+}

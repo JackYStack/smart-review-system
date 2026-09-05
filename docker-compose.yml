@@ -1,0 +1,263 @@
+# SmartReview local/demo stack.
+#
+# Only the frontend gateway is published. MySQL, MinIO, OnlyOffice, backend and
+# worker stay on the Compose network. Optional loopback-only maintenance ports
+# are defined in docker-compose.admin.yml.
+#
+# Start:
+#   docker compose --env-file .env.docker -f docker-compose.yml -f docker-compose.paddle.yml up -d --build
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-20m}
+    max-file: ${LOG_MAX_FILES:-5}
+
+x-backend-environment: &backend-environment
+  MYSQL_HOST: mysql
+  MYSQL_PORT: 3306
+  MYSQL_USER: ${MYSQL_USER:-smartreview}
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+  MYSQL_DB: ${MYSQL_DB:-review}
+  JWT_SECRET: ${JWT_SECRET}
+  SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:-}
+  CORS_ORIGINS: http://${HOST_IP},http://${HOST_IP}:${HTTP_PORT:-80},http://localhost,http://127.0.0.1
+  # MinIO requests use the single public gateway so generated presigned URLs are
+  # also usable by a remote browser. nginx proxies the configured bucket path.
+  MINIO_ENDPOINT: ${HOST_IP}:${HTTP_PORT:-80}
+  MINIO_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY:-${MINIO_ACCESS_KEY:-smartreview-storage}}
+  MINIO_SECRET_KEY: ${MINIO_APP_SECRET_KEY:-${MINIO_SECRET_KEY}}
+  MINIO_BUCKET: ${MINIO_BUCKET:-review}
+  MINIO_SECURE: "false"
+  PADDLEOCR_API_URL: ${PADDLEOCR_API_URL:-http://host.docker.internal:8080/layout-parsing}
+  PADDLEOCR_API_KEY: ${PADDLEOCR_API_KEY:-}
+  PADDLEOCR_TIMEOUT_SECONDS: ${PADDLEOCR_TIMEOUT_SECONDS:-600}
+  PADDLE_CONVERT_TIMEOUT_SECONDS: ${PADDLE_CONVERT_TIMEOUT_SECONDS:-180}
+  DIFY_WORKFLOW_ENABLED: ${DIFY_WORKFLOW_ENABLED:-false}
+  DIFY_WORKFLOW_BASE_URL: ${DIFY_WORKFLOW_BASE_URL:-}
+  DIFY_WORKFLOW_API_KEY: ${DIFY_WORKFLOW_API_KEY:-}
+  DIFY_WORKFLOW_USER_PREFIX: ${DIFY_WORKFLOW_USER_PREFIX:-smart-review}
+  DIFY_WORKFLOW_TIMEOUT_SECONDS: ${DIFY_WORKFLOW_TIMEOUT_SECONDS:-900}
+  ONLYOFFICE_DOCS_URL: http://${HOST_IP}:${HTTP_PORT:-80}/office
+  ONLYOFFICE_JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
+  ONLYOFFICE_CALLBACK_BASE_URL: http://backend:8000
+  ONLYOFFICE_EDITOR_LANG: zh
+  ADMIN_BOOTSTRAP: ${ADMIN_BOOTSTRAP:-false}
+  ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+  ADMIN_PHONE: ${ADMIN_PHONE:-13800000000}
+
+services:
+  mysql:
+    image: mysql:${MYSQL_IMAGE_TAG:-8.0.46}
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-${MYSQL_PASSWORD}}
+      MYSQL_DATABASE: ${MYSQL_DB:-review}
+      MYSQL_USER: ${MYSQL_USER:-smartreview}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    expose:
+      - "3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    mem_limit: ${MYSQL_MEMORY_LIMIT:-1g}
+    cpus: ${MYSQL_CPU_LIMIT:-1.5}
+    pids_limit: ${MYSQL_PIDS_LIMIT:-256}
+    logging: *default-logging
+
+  # This one-shot job also upgrades existing demo volumes from root-only access
+  # to the dedicated application account. It is safe and idempotent.
+  mysql-app-user:
+    image: mysql:${MYSQL_IMAGE_TAG:-8.0.46}
+    restart: "no"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-${MYSQL_PASSWORD}}
+      MYSQL_DATABASE: ${MYSQL_DB:-review}
+      MYSQL_USER: ${MYSQL_USER:-smartreview}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - ./deploy/mysql/ensure-app-user.sh:/usr/local/bin/ensure-app-user.sh:ro
+    entrypoint: ["/bin/bash", "/usr/local/bin/ensure-app-user.sh"]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${INIT_MEMORY_LIMIT:-256m}
+    cpus: ${INIT_CPU_LIMIT:-0.5}
+    pids_limit: ${INIT_PIDS_LIMIT:-64}
+    logging: *default-logging
+
+  minio:
+    image: minio/minio:${MINIO_IMAGE_TAG:-RELEASE.2025-09-07T16-13-09Z}
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-${MINIO_ACCESS_KEY:-minioadmin}}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-${MINIO_SECRET_KEY}}
+      MINIO_API_CORS_ALLOW_ORIGIN: http://${HOST_IP},http://${HOST_IP}:${HTTP_PORT:-80}
+    expose:
+      - "9000"
+      - "9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    mem_limit: ${MINIO_MEMORY_LIMIT:-1g}
+    cpus: ${MINIO_CPU_LIMIT:-1.5}
+    pids_limit: ${MINIO_PIDS_LIMIT:-256}
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  minio-app-user:
+    # Reuse the pinned server image: it contains the `mc` client used by the
+    # already-verified backup/restore scripts and avoids a second mutable image.
+    image: minio/minio:${MINIO_IMAGE_TAG:-RELEASE.2025-09-07T16-13-09Z}
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-${MINIO_ACCESS_KEY:-minioadmin}}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-${MINIO_SECRET_KEY}}
+      MINIO_APP_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY:-${MINIO_ACCESS_KEY:-smartreview-storage}}
+      MINIO_APP_SECRET_KEY: ${MINIO_APP_SECRET_KEY:-${MINIO_SECRET_KEY}}
+      MINIO_BUCKET: ${MINIO_BUCKET:-review}
+    volumes:
+      - ./deploy/minio/ensure-app-user.sh:/usr/local/bin/ensure-app-user.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/ensure-app-user.sh"]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${INIT_MEMORY_LIMIT:-256m}
+    cpus: ${INIT_CPU_LIMIT:-0.5}
+    pids_limit: ${INIT_PIDS_LIMIT:-64}
+    logging: *default-logging
+
+  onlyoffice:
+    image: onlyoffice/documentserver:${ONLYOFFICE_IMAGE_TAG:-9.4.0}
+    restart: unless-stopped
+    environment:
+      JWT_ENABLED: "true"
+      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
+    expose:
+      - "80"
+    volumes:
+      - onlyoffice_data:/var/www/onlyoffice/Data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/healthcheck"]
+      interval: 15s
+      timeout: 8s
+      retries: 40
+      start_period: 90s
+    mem_limit: ${ONLYOFFICE_MEMORY_LIMIT:-4g}
+    cpus: ${ONLYOFFICE_CPU_LIMIT:-3.0}
+    pids_limit: ${ONLYOFFICE_PIDS_LIMIT:-1024}
+    logging: *default-logging
+
+  backend:
+    build:
+      context: ./backend
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11.16-slim-bookworm}
+    image: smartreview-backend:${SMARTREVIEW_IMAGE_TAG:-0.2.0}
+    restart: unless-stopped
+    depends_on:
+      mysql-app-user:
+        condition: service_completed_successfully
+      minio-app-user:
+        condition: service_completed_successfully
+    environment: *backend-environment
+    expose:
+      - "8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+    mem_limit: ${BACKEND_MEMORY_LIMIT:-2g}
+    cpus: ${BACKEND_CPU_LIMIT:-2.0}
+    pids_limit: ${BACKEND_PIDS_LIMIT:-512}
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22.23.2-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.31.4-alpine}
+    image: smartreview-frontend:${SMARTREVIEW_IMAGE_TAG:-0.2.0}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      onlyoffice:
+        condition: service_healthy
+    environment:
+      MINIO_BUCKET: ${MINIO_BUCKET:-review}
+      NGINX_ENVSUBST_FILTER: MINIO_BUCKET
+    ports:
+      - "${FRONTEND_BIND_ADDRESS:-0.0.0.0}:${HTTP_PORT:-80}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    mem_limit: ${FRONTEND_MEMORY_LIMIT:-256m}
+    cpus: ${FRONTEND_CPU_LIMIT:-1.0}
+    pids_limit: ${FRONTEND_PIDS_LIMIT:-128}
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  worker:
+    build:
+      context: ./backend
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11.16-slim-bookworm}
+    image: smartreview-backend:${SMARTREVIEW_IMAGE_TAG:-0.2.0}
+    restart: unless-stopped
+    depends_on:
+      mysql-app-user:
+        condition: service_completed_successfully
+      minio-app-user:
+        condition: service_completed_successfully
+    command: ["sh", "-c", "exec python worker.py --poll-interval ${WORKER_POLL_INTERVAL:-2}"]
+    environment: *backend-environment
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from sqlalchemy import text; from app.database import engine; c=engine.connect(); c.execute(text('SELECT 1')); c.close()"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    mem_limit: ${WORKER_MEMORY_LIMIT:-4g}
+    cpus: ${WORKER_CPU_LIMIT:-3.0}
+    pids_limit: ${WORKER_PIDS_LIMIT:-512}
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+volumes:
+  mysql_data:
+  minio_data:
+  onlyoffice_data:

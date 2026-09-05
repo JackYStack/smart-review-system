@@ -1,0 +1,48 @@
+# 与主 docker-compose.yml 叠加使用，为 SmartReview 启动官方 PP-StructureV3 服务。
+# CPU 首次启动会下载模型，耗时和内存占用都较高；生产环境可改用 GPU。
+
+services:
+  paddleocr:
+    build:
+      context: ./paddleocr
+    image: smartreview-paddleocr:${SMARTREVIEW_IMAGE_TAG:-0.2.0}
+    restart: unless-stopped
+    environment:
+      PADDLEOCR_DEVICE: ${PADDLEOCR_DEVICE:-cpu}
+    expose:
+      - "8080"
+    volumes:
+      - paddleocr_models:/root/.paddlex
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 60
+      start_period: 180s
+    mem_limit: ${PADDLEOCR_MEMORY_LIMIT:-8g}
+    cpus: ${PADDLEOCR_CPU_LIMIT:-4.0}
+    pids_limit: ${PADDLEOCR_PIDS_LIMIT:-1024}
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE:-20m}
+        max-file: ${LOG_MAX_FILES:-5}
+
+  backend:
+    depends_on:
+      paddleocr:
+        condition: service_healthy
+    environment:
+      PADDLEOCR_API_URL: http://paddleocr:8080/layout-parsing
+
+  worker:
+    depends_on:
+      paddleocr:
+        condition: service_healthy
+    environment:
+      PADDLEOCR_API_URL: http://paddleocr:8080/layout-parsing
+
+volumes:
+  paddleocr_models:

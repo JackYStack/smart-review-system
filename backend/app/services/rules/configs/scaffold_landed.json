@@ -1,7 +1,0 @@
-{
-  "scenario": "scaffold_landed",
-  "name": "落地式钢管脚手架",
-  "thresholds": {
-    "erection_height_m": 24
-  }
-}

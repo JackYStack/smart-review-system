@@ -1,0 +1,295 @@
+import json
+import re
+import uuid
+from datetime import UTC, datetime
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.database import get_db
+from app.deps import get_current_user, require_admin
+from app.models.scheme_template import SchemeTemplate
+from app.models.scheme_type import SchemeType
+from app.models.user import User
+from app.schemas.template import (
+    DownloadUrlResponse,
+    FullDocumentReviewConfigUpdate,
+    ReviewWorkflowUpdate,
+    TemplatePublic,
+    TemplateStructureUpdate,
+    TemplateUploadResponse,
+)
+from app.services import minio_storage
+from app.services.integration_settings import resolve_document_integration
+from app.services.paddle_document_parser import (
+    PaddleDocumentParseError,
+    parse_docx_to_tree_with_paddle,
+    tree_to_json_str,
+)
+from app.services.upload_validation import UploadValidationError, validate_docx_upload
+from app.services.template_versioning import record_template_version
+
+router = APIRouter(tags=["templates"])
+
+MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+
+
+def _invalidate_scheme_publication(scheme: SchemeType) -> None:
+    """Any template/config mutation requires a new readiness verification."""
+    if scheme.lifecycle_status == "published":
+        scheme.lifecycle_status = "pending_validation"
+    elif scheme.lifecycle_status != "disabled":
+        scheme.lifecycle_status = "draft"
+    scheme.published_at = None
+    scheme.published_by_id = None
+    scheme.published_template_version_id = None
+
+
+def _download_filename_for_scheme_template(scheme: SchemeType) -> str:
+    """Human-readable .docx name: 方案大类 + 方案名称（与前台展示一致）。"""
+    def clean(part: str) -> str:
+        s = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", (part or "").strip())
+        s = re.sub(r"\s+", " ", s).strip()
+        return s[:120]
+
+    cat, name = clean(scheme.category), clean(scheme.name)
+    if cat and name:
+        base = f"{cat}_{name}"
+    else:
+        base = cat or name or "方案模板"
+    if not base.lower().endswith(".docx"):
+        base = f"{base}.docx"
+    return base
+
+
+def _validate_parsed_structure_blob(obj: object) -> None:
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=400, detail="parsed_structure 须为 JSON 对象")
+    nodes = obj.get("nodes")
+    if not isinstance(nodes, list):
+        raise HTTPException(status_code=400, detail="parsed_structure 须包含 nodes 数组")
+
+
+def _template_public(t: SchemeTemplate) -> TemplatePublic:
+    structure = None
+    if t.parsed_structure:
+        try:
+            structure = json.loads(t.parsed_structure)
+        except json.JSONDecodeError:
+            structure = None
+    workflow = None
+    if t.review_workflow:
+        try:
+            workflow = json.loads(t.review_workflow)
+        except json.JSONDecodeError:
+            workflow = None
+    full_doc = None
+    if t.full_document_review_config:
+        try:
+            full_doc = json.loads(t.full_document_review_config)
+        except json.JSONDecodeError:
+            full_doc = None
+    return TemplatePublic(
+        id=t.id,
+        scheme_type_id=t.scheme_type_id,
+        minio_bucket=t.minio_bucket,
+        object_key=t.object_key,
+        original_filename=t.original_filename,
+        parsed_structure=structure,
+        review_workflow=workflow,
+        full_document_review_config=full_doc,
+        parsed_at=t.parsed_at,
+        updated_at=t.updated_at,
+    )
+
+
+@router.post(
+    "/scheme-types/{scheme_id}/template",
+    response_model=TemplateUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_template(
+    scheme_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    file: UploadFile = File(...),
+) -> TemplateUploadResponse:
+    scheme = db.get(SchemeType, scheme_id)
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="方案类型不存在")
+    data = await file.read()
+    try:
+        validate_docx_upload(file.filename, data)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        tree = parse_docx_to_tree_with_paddle(
+            data,
+            runtime=resolve_document_integration(db),
+        )
+        parsed_json = tree_to_json_str(tree)
+    except PaddleDocumentParseError as e:
+        raise HTTPException(status_code=400, detail=f"PaddleOCR 无法解析文档: {e!s}") from e
+
+    s = get_settings()
+    object_key = f"templates/{scheme_id}/{uuid.uuid4().hex}.docx"
+    try:
+        minio_storage.put_object(
+            object_key,
+            data,
+            length=len(data),
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"存储失败: {e!s}") from e
+
+    existing = db.query(SchemeTemplate).filter(SchemeTemplate.scheme_type_id == scheme_id).first()
+    now = datetime.now(UTC)
+    if existing:
+        existing.object_key = object_key
+        existing.minio_bucket = s.minio_bucket
+        existing.original_filename = file.filename or "template.docx"
+        existing.parsed_structure = parsed_json
+        existing.parsed_at = now
+        _invalidate_scheme_publication(scheme)
+        db.flush()
+        record_template_version(db, existing, actor_id=admin.id, content_bytes=data)
+        db.commit()
+        db.refresh(existing)
+        return TemplateUploadResponse(template=_template_public(existing), message="updated")
+    row = SchemeTemplate(
+        scheme_type_id=scheme_id,
+        minio_bucket=s.minio_bucket,
+        object_key=object_key,
+        original_filename=file.filename or "template.docx",
+        parsed_structure=parsed_json,
+        parsed_at=now,
+    )
+    _invalidate_scheme_publication(scheme)
+    db.add(row)
+    db.flush()
+    record_template_version(db, row, actor_id=admin.id, content_bytes=data)
+    db.commit()
+    db.refresh(row)
+    return TemplateUploadResponse(template=_template_public(row), message="created")
+
+
+@router.get("/scheme-types/{scheme_id}/template", response_model=TemplatePublic)
+def get_template(
+    scheme_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> TemplatePublic:
+    scheme = db.get(SchemeType, scheme_id)
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="方案类型不存在")
+    t = db.query(SchemeTemplate).filter(SchemeTemplate.scheme_type_id == scheme_id).first()
+    if t is None:
+        raise HTTPException(status_code=404, detail="尚未上传模版")
+    return _template_public(t)
+
+
+@router.put("/scheme-types/{scheme_id}/template/structure", response_model=TemplatePublic)
+def update_template_structure(
+    scheme_id: int,
+    body: TemplateStructureUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> TemplatePublic:
+    scheme = db.get(SchemeType, scheme_id)
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="方案类型不存在")
+    t = db.query(SchemeTemplate).filter(SchemeTemplate.scheme_type_id == scheme_id).first()
+    if t is None:
+        raise HTTPException(status_code=404, detail="尚未上传模版")
+    _validate_parsed_structure_blob(body.parsed_structure)
+    try:
+        t.parsed_structure = json.dumps(body.parsed_structure, ensure_ascii=False)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"无法序列化 JSON: {e!s}") from e
+    _invalidate_scheme_publication(scheme)
+    record_template_version(db, t, actor_id=admin.id)
+    db.commit()
+    db.refresh(t)
+    return _template_public(t)
+
+
+@router.put("/scheme-types/{scheme_id}/template/review-workflow", response_model=TemplatePublic)
+def update_template_review_workflow(
+    scheme_id: int,
+    body: ReviewWorkflowUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> TemplatePublic:
+    scheme = db.get(SchemeType, scheme_id)
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="方案类型不存在")
+    t = db.query(SchemeTemplate).filter(SchemeTemplate.scheme_type_id == scheme_id).first()
+    if t is None:
+        raise HTTPException(status_code=404, detail="尚未上传模版")
+    try:
+        t.review_workflow = json.dumps(
+            body.review_workflow.model_dump(), ensure_ascii=False
+        )
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"无法序列化工作流: {e!s}") from e
+    _invalidate_scheme_publication(scheme)
+    record_template_version(db, t, actor_id=admin.id)
+    db.commit()
+    db.refresh(t)
+    return _template_public(t)
+
+
+@router.put(
+    "/scheme-types/{scheme_id}/template/full-document-review",
+    response_model=TemplatePublic,
+)
+def update_template_full_document_review(
+    scheme_id: int,
+    body: FullDocumentReviewConfigUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> TemplatePublic:
+    scheme = db.get(SchemeType, scheme_id)
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="方案类型不存在")
+    t = db.query(SchemeTemplate).filter(SchemeTemplate.scheme_type_id == scheme_id).first()
+    if t is None:
+        raise HTTPException(status_code=404, detail="尚未上传模版")
+    try:
+        t.full_document_review_config = json.dumps(
+            body.full_document_review_config.model_dump(),
+            ensure_ascii=False,
+        )
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"无法序列化配置: {e!s}") from e
+    _invalidate_scheme_publication(scheme)
+    record_template_version(db, t, actor_id=admin.id)
+    db.commit()
+    db.refresh(t)
+    return _template_public(t)
+
+
+@router.get("/scheme-types/{scheme_id}/template/download-url", response_model=DownloadUrlResponse)
+def get_template_download_url(
+    scheme_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+    expires_seconds: int = 3600,
+) -> DownloadUrlResponse:
+    scheme = db.get(SchemeType, scheme_id)
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="方案类型不存在")
+    t = db.query(SchemeTemplate).filter(SchemeTemplate.scheme_type_id == scheme_id).first()
+    if t is None:
+        raise HTTPException(status_code=404, detail="尚未上传模版")
+    try:
+        url = minio_storage.presigned_get_url(
+            t.object_key,
+            expires_seconds=expires_seconds,
+            download_filename=_download_filename_for_scheme_template(scheme),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"无法生成下载链接: {e!s}") from e
+    return DownloadUrlResponse(url=url, expires_seconds=expires_seconds)
