@@ -26,18 +26,7 @@ SmartReview 是面向危险性较大的分部分项工程专项施工方案的 *
 
 ## 审查流程
 
-```mermaid
-flowchart LR
-  A[项目与方案上传] --> B[PaddleOCR 文档解析]
-  B --> C[模板结构比对]
-  C --> D[规则与公式校验]
-  D --> E[Dify / LLM 语义与图文审查]
-  E --> F[问题证据链与 Word 批注]
-  F --> G[专家逐项复核]
-  G --> H{专家决定}
-  H -->|退回| A
-  H -->|批准| I[签发不可变报告]
-```
+![从工程文档到可追溯审查结论的技术路线](images/outcome/technical-review-path.png)
 
 方案类型只有在模板、规则、Workflow 与外部集成通过就绪检查并正式发布后，才能创建正式审查任务。任务执行时会保存配置和输入快照，后续修改配置不会改变历史任务。
 
@@ -51,19 +40,7 @@ flowchart LR
 | 智能处理 | PaddleOCR PP-StructureV3、Dify Dataset / Workflow、可配置 LLM |
 | 运行方式 | Docker Compose、独立异步 Worker、Nginx 单入口 |
 
-```mermaid
-flowchart TB
-  Browser[浏览器] --> Gateway[Frontend / Nginx]
-  Gateway --> API[FastAPI]
-  Gateway --> Office[OnlyOffice]
-  API --> DB[(MySQL)]
-  API --> Store[(MinIO)]
-  Worker[Review Worker] --> DB
-  Worker --> Store
-  Worker --> OCR[PaddleOCR]
-  Worker -.可选.-> Dify[Dify Dataset / Workflow]
-  Worker -.可选.-> LLM[LLM Provider]
-```
+![系统总体架构](images/outcome/system-architecture.png)
 
 默认 Compose 仅向宿主机发布前端统一入口；API、MySQL、MinIO、OnlyOffice、Worker 与 PaddleOCR 均保留在容器网络内。维护端口需要显式叠加 `docker-compose.admin.yml`。
 
@@ -188,19 +165,17 @@ docker-compose*.yml         基础及 Paddle/生产/安全/维护叠加编排
 - 本地、维护及 HTTPS Compose 配置校验；
 - Playwright 演示与真实环境 E2E 测试配置。
 
-## 界面预览
+## 成果界面预览
 
 | 数据分析 | 模板管理 |
 | --- | --- |
-| ![数据分析](images/数据统计.png) | ![模板管理](images/模板管理.png) |
+| ![数据分析](images/outcome/dashboard.png) | ![模板管理](images/outcome/template-management.png) |
 
-| 规则配置 | 方案审查 |
+| 审查工作流 | 文档批注与在线预览 |
 | --- | --- |
-| ![规则配置](images/规则设置.png) | ![方案审查](images/方案审核.png) |
+| ![审查工作流](images/outcome/review-workflow.png) | ![文档批注与在线预览](images/outcome/document-review.png) |
 
-| 人工审阅 | 在线预览 |
-| --- | --- |
-| ![人工审阅](images/人工审阅7.png) | ![在线预览](images/预览.png) |
+以上图片均提取自项目成果材料中的原始高清媒体，未使用整页演示文稿截图。
 
 ## 当前边界
 
