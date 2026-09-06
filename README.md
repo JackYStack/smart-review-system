@@ -165,7 +165,7 @@ docker-compose*.yml         基础及 Paddle/生产/安全/维护叠加编排
 - 本地、维护及 HTTPS Compose 配置校验；
 - Playwright 演示与真实环境 E2E 测试配置。
 
-## 成果界面预览
+## 界面预览
 
 | 数据分析 | 模板管理 |
 | --- | --- |
@@ -174,8 +174,6 @@ docker-compose*.yml         基础及 Paddle/生产/安全/维护叠加编排
 | 审查工作流 | 文档批注与在线预览 |
 | --- | --- |
 | ![审查工作流](images/outcome/review-workflow.png) | ![文档批注与在线预览](images/outcome/document-review.png) |
-
-以上图片均提取自项目成果材料中的原始高清媒体，未使用整页演示文稿截图。
 
 ## 当前边界
 
