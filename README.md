@@ -1,217 +1,216 @@
-# SmartReview（危大工程专项方案智能审查系统）
+# SmartReview｜危大工程专项施工方案智能审查系统
 
-> 本仓库以前端、后端、数据库、对象存储、异步 Worker、OnlyOffice、知识库和大模型组成完整审查平台。与参考项目相比，本项目的文档内容解析统一采用 **PaddleOCR PP-StructureV3**：DOCX 先由 LibreOffice 转为 PDF，再识别标题、正文、表格和公式，最后进入结构匹配、规则审查和大模型审查。系统不会静默回退到 Word 文本解析。部署说明见 [PaddleOCR 文档解析配置](docs/PADDLE_PARSER.md)。
+SmartReview 是面向危险性较大的分部分项工程专项施工方案的 **AI 辅助审查平台**。系统将文档结构识别、规范语义审查、确定性规则与公式校验、人工专家复核、在线修订和正式签发串成完整闭环，并保留任务配置、问题证据、文档版本和操作审计记录。
 
-部署端口隔离、HTTPS、健康检查、成套备份与恢复演练见 [部署、健康检查与灾难恢复](docs/DEPLOYMENT_AND_RECOVERY.md)。
+> AI 输出只作为辅助审查线索。缺少方案原文定位、规范编号、条款号或条款原文的结果会被降级为“待人工判断”；只有专家完成复核与签发后，才形成正式人工结论。
 
-Dify 分为 Dataset 知识库检索和 Workflow 全文审查两套独立鉴权，配置与输出格式见 [Dify Workflow 全文审查对接](docs/DIFY_WORKFLOW.md)。
+## 系统能力
 
-包含 PaddleOCR 的完整 Docker 启动命令：
+| 能力 | 当前实现 |
+| --- | --- |
+| 文档解析 | DOCX 经 LibreOffice 转为 PDF，由 PaddleOCR PP-StructureV3 识别标题、正文、表格与公式，再生成章节树；解析失败会明确报错，不静默切换解析器。 |
+| 语义审查 | 按方案类型和章节配置提示词、引用章节、编制依据与 Dify Dataset；支持 Dify Workflow 全文审查及火山引擎、MiniMax、DeepSeek 等模型。 |
+| 规范证据链 | 审查问题可记录方案原文、章节路径、页码、规范编号、条款号、条款原文、知识库片段及检索分数；证据缺失时强制提示人工核验。 |
+| 图文材料 | 支持上传辅助文档与现场图片，提取 DOCX 内嵌图片，并将图片作为多模态输入交给按类型配置的 Dify Workflow。 |
+| 计算校验 | 提供确定性规则与公式引擎、单位归一、参数范围、跨字段比较、公式计算、计算步骤与参数来源留痕。 |
+| 专家复核 | 支持任务领取/释放、问题逐项处置、退回整改、复核、批准、OnlyOffice 在线修订及正式报告签发。 |
+| 文档治理 | 原始方案、AI 批注版、专家编辑版和签发报告分别登记为不可变制品，记录 SHA-256、版本关系与操作审计。 |
+| 任务治理 | 支持优先级、幂等提交、取消、重试、Worker 租约、技术状态/业务结论/结果完整性/人工状态分离。 |
+| 运维安全 | 提供健康检查、HTTPS 入口、容器资源限制、日志轮转、可选 ClamAV 扫描、MySQL 与 MinIO 成套备份恢复。 |
 
-```powershell
-docker compose --env-file .env.docker -f docker-compose.yml -f docker-compose.paddle.yml up -d --build
+### 关于三类智能审查要求
+
+- **语义审查：已实现。** 可结合章节规则、编制依据、Dify 知识库与大模型定位疑似违规项并返回整改建议，是否达到业务精度取决于正式规范库、提示词和标注样本的质量。
+- **图文一致性校验：具备接入链路。** 系统已经能够提取/上传图片并交给多模态 Workflow，但节点详图构件级识别、尺寸标注解析及与正文的专项确定性交叉规则，仍需针对具体危大工程类型继续配置和验收。
+- **计算校验：引擎已实现。** 可执行单位换算、范围检查、字段交叉比较和受限安全公式；正式使用前仍需由专业人员录入并确认各方案类型的参数、阈值和计算公式。
+
+## 审查流程
+
+```mermaid
+flowchart LR
+  A[项目与方案上传] --> B[PaddleOCR 文档解析]
+  B --> C[模板结构比对]
+  C --> D[规则与公式校验]
+  D --> E[Dify / LLM 语义与图文审查]
+  E --> F[问题证据链与 Word 批注]
+  F --> G[专家逐项复核]
+  G --> H{专家决定}
+  H -->|退回| A
+  H -->|批准| I[签发不可变报告]
 ```
 
-如果只想先查看完整界面和审查闭环，可使用不依赖外部服务的离线演示：
+方案类型只有在模板、规则、Workflow 与外部集成通过就绪检查并正式发布后，才能创建正式审查任务。任务执行时会保存配置和输入快照，后续修改配置不会改变历史任务。
+
+## 技术架构
+
+| 层级 | 技术 |
+| --- | --- |
+| 前端 | React 19、TypeScript、Vite 8、Ant Design 6、TanStack Query、React Router |
+| 后端 | Python 3.11、FastAPI、SQLAlchemy、Alembic、JWT |
+| 数据与文档 | MySQL 8、MinIO、OnlyOffice Document Server |
+| 智能处理 | PaddleOCR PP-StructureV3、Dify Dataset / Workflow、可配置 LLM |
+| 运行方式 | Docker Compose、独立异步 Worker、Nginx 单入口 |
+
+```mermaid
+flowchart TB
+  Browser[浏览器] --> Gateway[Frontend / Nginx]
+  Gateway --> API[FastAPI]
+  Gateway --> Office[OnlyOffice]
+  API --> DB[(MySQL)]
+  API --> Store[(MinIO)]
+  Worker[Review Worker] --> DB
+  Worker --> Store
+  Worker --> OCR[PaddleOCR]
+  Worker -.可选.-> Dify[Dify Dataset / Workflow]
+  Worker -.可选.-> LLM[LLM Provider]
+```
+
+默认 Compose 仅向宿主机发布前端统一入口；API、MySQL、MinIO、OnlyOffice、Worker 与 PaddleOCR 均保留在容器网络内。维护端口需要显式叠加 `docker-compose.admin.yml`。
+
+## 快速体验
+
+只查看界面和演示审查闭环时，可启动不依赖外部 Dify/LLM 的离线演示：
 
 ```powershell
 .\scripts\start_demo_mode.ps1
 ```
 
-它通过 `VITE_DEMO_MODE=true` 启用前端内置演示数据，地址为 `http://127.0.0.1:5173`。
+浏览器访问 `http://127.0.0.1:5173`。演示数据位于 `demo-data/` 与 `frontend/public/demo-assets/`。
 
-## 简介
+## Docker 部署
 
-SmartReview 面向施工方案的全流程管理与智能审核。系统支持账号与角色、方案类型与编制依据维护、按方案类型绑定 Word 模板（对象存储中的文件与标题树 JSON）、方案审核任务与报表，以及管理仪表盘与系统设置（知识库、审核策略、大模型、OnlyOffice 等）。
+### 1. 准备环境
 
-后端基于 FastAPI，并与独立 Worker 进程协同处理待办审核队列；可选对接自建 Dify 与火山引擎、MiniMax 等 LLM。
+- Docker Desktop 或 Docker Engine + Compose V2
+- 根据 Compose 中的资源限制为 MySQL、OnlyOffice、PaddleOCR、API 与 Worker 预留足够内存；CPU 首次启动 PaddleOCR 时需要下载模型
+- 一台可被浏览器访问的主机地址，填写到 `HOST_IP`，不要填写 `127.0.0.1`
 
-**这个可以进一步扩展到像变更方案审核、合同审核等。**
+### 2. 创建配置
 
-
-## 核心能力
-
-- **身份与权限**：登录、JWT、用户与角色管理。
-- **主数据**：方案类型、编制依据（管理员 CRUD）；方案类型绑定的 Word 模板与 MinIO 存储、标题树结构。
-- **审核任务**：创建与跟踪方案审核任务；**API 与独立 Worker**（`worker.py`、队列轮询）并行读写 MySQL / MinIO，Docker Compose 中对应 `worker` 服务。
-- **在线编辑**：**OnlyOffice** 文档服务集成（JWT、回调 URL；可在环境变量或系统「设置 → OnlyOffice」中配置，详见 [.env.example](.env.example)）。
-- **可选集成**：Dify 知识库 API（`DIFY_*`）、大模型提供方（如火山引擎、MiniMax、DeepSeek；环境变量与数据库设置并存，见 [.env.example](.env.example)）。
-- **仪表盘**：统计与定时快照（API 启动时的 `dashboard_scheduler`）。
-
-## 技术栈
-
-| 层级 | 技术 |
-| --- | --- |
-| 前端 | React 19、Vite 8、TypeScript、Ant Design 6、TanStack Query、React Router |
-| 后端 | Python 3.11+、FastAPI、SQLAlchemy、Alembic、MySQL、MinIO、JWT |
-| 运行与编排 | Docker Compose：MySQL、MinIO、OnlyOffice Document Server、`smartreview-backend`、`smartreview-frontend`、Worker |
-
-更细的本地安装、迁移与启动命令见 [backend/README.md](backend/README.md)。
-
-## 架构
-
-### 逻辑组件
-
-```mermaid
-flowchart LR
-  Browser[Browser]
-  Frontend[Frontend_Nginx]
-  Backend[Backend_API]
-  Worker[Worker]
-  MySQL[(MySQL)]
-  MinIO[(MinIO)]
-  OnlyOffice[OnlyOffice]
-  Dify[Dify_optional]
-  LLM[LLM_optional]
-
-  Browser --> Frontend
-  Frontend --> Backend
-  Backend --> MySQL
-  Backend --> MinIO
-  Worker --> MySQL
-  Worker --> MinIO
-  Backend <--> OnlyOffice
-  Backend -.-> Dify
-  Backend -.-> LLM
+```powershell
+Copy-Item .env.docker.example .env.docker
 ```
 
-### Docker 部署视图（端口与依赖）
+至少修改以下项目：
 
-宿主机需配置 `HOST_IP`（浏览器可访问的本机地址，勿填 `127.0.0.1`，以便容器经宿主机访问 MinIO 等；见仓库根目录 Compose 文件头注释）。常见端口：前端 **80**，OnlyOffice **9080**，MinIO **9000**（S3 API）与 **9001**（控制台），MySQL **3306**；后端 API 在 Compose 网络内由前端反代访问，OnlyOffice 回调指向后端服务。
+- `HOST_IP`
+- `MYSQL_ROOT_PASSWORD`、`MYSQL_PASSWORD`
+- `MINIO_ROOT_PASSWORD`、`MINIO_APP_SECRET_KEY`
+- `JWT_SECRET`
+- `ONLYOFFICE_JWT_SECRET`
+- 首次创建管理员所需的 `ADMIN_BOOTSTRAP`、`ADMIN_USERNAME`、`ADMIN_PASSWORD`
 
-```mermaid
-flowchart TB
-  subgraph host [Docker_host]
-    U[Browser]
-    Fe[frontend_port_80]
-    Be[backend_internal]
-    Wo[worker]
-    Db[(mysql_3306)]
-    Obj[(minio_9000_9001)]
-    Oo[onlyoffice_9080]
-  end
+真实密码和 API Key 只能保存在被 Git 忽略的 `.env.docker` 或 `backend/.env` 中，禁止提交到仓库。
 
-  U --> Fe
-  Fe --> Be
-  Be --> Db
-  Be --> Obj
-  Be <--> Oo
-  Wo --> Db
-  Wo --> Obj
+### 3. 启动完整基础栈
+
+```powershell
+docker compose --env-file .env.docker `
+  -f docker-compose.yml `
+  -f docker-compose.paddle.yml up -d --build
 ```
+
+启动完成后访问 `http://HOST_IP/`。首次管理员创建成功后，应把 `ADMIN_BOOTSTRAP` 改回 `false` 并重新启动服务。
+
+### 4. 检查服务
+
+```powershell
+docker compose --env-file .env.docker `
+  -f docker-compose.yml `
+  -f docker-compose.paddle.yml ps
+
+Invoke-RestMethod http://127.0.0.1/api/health/live
+Invoke-WebRequest http://127.0.0.1/api/health/ready -UseBasicParsing
+```
+
+完整生产 HTTPS、ClamAV、资源限制、备份和恢复步骤见 [部署与灾难恢复手册](docs/DEPLOYMENT_AND_RECOVERY.md)。
+
+## 首次业务配置
+
+1. 在“设置”中配置知识库、模型、审查参数和 OnlyOffice。
+2. 新建方案类型并维护相应编制依据。
+3. 上传 Word 模板，由 PaddleOCR 解析章节结构。
+4. 配置章节提示词、引用关系、知识库、确定性规则和计算公式。
+5. 按方案类型绑定并测试 Dify Workflow；提交就绪验证后发布。
+6. 使用已知缺陷样本发起审查，核对问题、证据、批注和计算过程。
+7. 由专家逐项处理问题，完成整改闭环和正式签发。
+
+Dify 的 Dataset API Key 与 Workflow App Key 是两套独立凭据，不得混用。详细输入映射、严格 JSON 输出格式和联调方法见 [Dify Workflow 对接说明](docs/DIFY_WORKFLOW.md)。本仓库不包含 Dify 自身的部署编排。
+
+## 配置与数据迁移
+
+系统配置可导出为迁移包，包含方案类型、编制依据、项目、规则、公式、系统设置、Dify Profile、模板文件和清单：
+
+```powershell
+.\scripts\export-system-config.ps1 `
+  -ApiBase http://127.0.0.1/api `
+  -OutputDirectory D:\SmartReviewConfig
+```
+
+在目标系统导入：
+
+```powershell
+.\scripts\import-system-config.ps1 `
+  -ApiBase http://127.0.0.1/api `
+  -InputDirectory D:\SmartReviewConfig
+```
+
+导出 JSON 只记录外部服务是否已配置，不包含 API Key、JWT 或数据库密码明文；导入前须在目标环境的 `.env.docker` 中重新填写各类密钥。
+
+配置迁移包不代替业务数据备份。MySQL 与 MinIO 必须使用成套备份脚本迁移，并校验 `manifest.json` 中的文件大小和 SHA-256：
+
+```powershell
+.\scripts\backup-smartreview.ps1 -BackupRoot D:\SmartReviewBackups
+.\scripts\restore-smartreview.ps1 -BackupPath <备份目录> -VerifyOnly
+```
+
+恢复会覆盖目标环境数据，执行前请完整阅读 [部署与灾难恢复手册](docs/DEPLOYMENT_AND_RECOVERY.md)。
 
 ## 仓库结构
 
-- `backend/` — FastAPI 应用、Alembic 迁移、`worker.py` 审核任务 Worker；说明见 [backend/README.md](backend/README.md)。
-- `frontend/` — 管理端 SPA（Vite）。
-- 根目录默认编排文件为 `docker-compose.yml`，并可按需叠加 `docker-compose.paddle.yml`、`docker-compose.production.yml`、`docker-compose.security.yml` 与 `docker-compose.admin.yml`。
+```text
+backend/                    FastAPI、Alembic、审查服务、Worker 与测试
+frontend/                   React 管理端、离线演示与 Playwright 测试
+paddleocr/                  PP-StructureV3 服务镜像
+deploy/                     HTTPS、初始化与恢复演练配置
+scripts/                    启停、配置迁移、备份与恢复脚本
+docs/                       部署、Dify、PaddleOCR 和实施状态说明
+demo-data/                  无敏感信息的演示样本与审查成果
+docker-compose*.yml         基础及 Paddle/生产/安全/维护叠加编排
+```
 
-当前默认品牌图与浏览器 Tab 图标：`frontend/public/building.png`。
+## 开发与验证
 
-## 配置
+本地后端安装、迁移与启动见 [backend/README.md](backend/README.md)，新手部署顺序见 [新手启动说明](docs/新手启动说明.md)。仓库 CI 包含：
 
-将 [.env.example](.env.example) 复制为 `backend/.env`，按环境填写 MySQL、MinIO、`JWT_SECRET` 等。**勿将真实密码提交到 Git。** 本地开发请只用 `backend/.env`，不要用仓库根目录的 `.env`，以免与 Docker 环境变量混用。
+- 前端依赖锁定安装、ESLint、TypeScript 和生产构建；
+- 后端源码编译、Alembic 迁移和 pytest；
+- 本地、维护及 HTTPS Compose 配置校验；
+- Playwright 演示与真实环境 E2E 测试配置。
 
-**Docker Compose** 与本地配置分开：将 [.env.docker.example](.env.docker.example) 复制为仓库根目录 `.env.docker`。启动默认演示栈时执行 `docker compose --env-file .env.docker -f docker-compose.yml -f docker-compose.paddle.yml up -d --build`。生产、杀毒扫描和管理端口均通过独立叠加文件显式启用；完整命令与验收步骤见 [部署与恢复手册](docs/DEPLOYMENT_AND_RECOVERY.md)。
+## 界面预览
 
-前端开发默认通过 Vite 代理访问 API：请求发往 `/api`，由 `frontend/vite.config.ts` 转发到 `http://127.0.0.1:8000`。若需直连，可设置环境变量 `VITE_API_BASE_URL`（例如 `http://127.0.0.1:8000`）。
+| 数据分析 | 模板管理 |
+| --- | --- |
+| ![数据分析](images/数据统计.png) | ![模板管理](images/模板管理.png) |
 
-## 快速开始
+| 规则配置 | 方案审查 |
+| --- | --- |
+| ![规则配置](images/规则设置.png) | ![方案审查](images/方案审核.png) |
 
-1. 在 MySQL 中创建与 `backend/.env` 一致的数据库，在 `backend/` 执行数据库迁移（`alembic upgrade head`），具体命令见 [backend/README.md](backend/README.md)。
-2. 启动 MinIO，并创建与配置一致的 bucket（或留空由上传接口自动创建）。
-3. 在 `backend/` 用 `uvicorn` 启动 API；在 `frontend/` 执行 `npm install` 与 `npm run dev`。管理员可通过 `ADMIN_BOOTSTRAP` 首次创建，或使用 `backend/scripts/create_admin.py`，详见 [backend/README.md](backend/README.md)。
-4. 浏览器访问开发服务器地址（默认 `http://localhost:5173`）。
+| 人工审阅 | 在线预览 |
+| --- | --- |
+| ![人工审阅](images/人工审阅7.png) | ![在线预览](images/预览.png) |
 
-## Dify 部署手册（Docker Compose）
+## 当前边界
 
-若需自建并接入 Dify，请以官方文档为准：
+- 仓库提供的是平台代码和演示配置，不包含各类危大工程的正式规范全文、生产规则阈值、完整计算公式或足量标注样本。
+- 图纸构件级识别和工程类型专用图文交叉规则需要结合样本、模型和专业规则继续建设。
+- 正式上线前必须完成专家验收、现行规范核验、HTTPS/防火墙配置、恶意文件扫描和异地备份恢复演练。
+- 外部知识库或模型不可用时，系统会保留降级/失败状态，不会将未执行的审查显示为“全部通过”。
 
-- [Dify Docker Compose 快速开始（中文）](https://docs.dify.ai/zh/self-host/quick-start/docker-compose)
+当前实施与验收记录见 [实施状态（2026-08-25）](docs/IMPLEMENTATION_STATUS_20260825.md)。
 
-建议顺序：
+## License
 
-1. 安装 Docker、Docker Compose、Git。
-2. 按官方文档克隆 Dify 部署仓库并进入目录。
-3. 将官方示例环境文件复制为 `.env` 并完成配置。
-4. 使用官方推荐的 `docker compose up -d` 一类命令启动服务。
-5. 浏览器打开 Dify Web 完成初始化。
-
-本仓库**不包含** Dify 的 Compose 编排文件；接入时在 SmartReview 的「设置」或环境变量中填写 Dify 基址与 API Key（见 [.env.example](.env.example) 中 `DIFY_*`）。
-
-## 需求说明
-
-功能与模块划分见上文；数据库与对象存储连接信息仅通过环境变量与系统设置配置，本文档不列举口令。
-
-## 系统说明
-
-### 1. 数据分析
-
-![数据分析页面](images/数据统计.png)
-
-页面用于汇总系统运行概况，便于快速判断当前审核进度与资源消耗。
-
-- **核心信息**：方案数量、审核任务状态、知识库信息、Token 消耗等。
-- **使用价值**：帮助管理员快速识别任务积压、资源开销和重点跟进项。
-
-### 2. 模板管理与规则设置
-
-![模板管理页面](images/模板管理.png)
-
-在模板管理中可维护方案模板。点击“更新 Word”后，系统会加载文档结构，再进入规则设置进行章节级配置。
-
-![规则设置页面](images/规则设置.png)
-
-规则设置支持按章节节点配置审核上下文：
-
-- **引用**：审核当前章节时，引用其他内部章节内容。
-- **知识库**：绑定当前章节审核依赖的外部知识库。
-- **审核提示词**：定义当前章节的审核指令与关注点。
-- **上下文一致性校验**：检查当前章节与其他章节在语义、数据上的一致性。
-- **编制依据**：校验章节内容是否符合系统预置编制依据。
-
-规则配置越完整，审核结果通常越准确、越稳定。
-
-随后可配置审核工作流，按需开启或关闭对应流程环节。
-
-![流程开关页面](images/流程开关.png)
-
-### 3. 系统设置
-
-系统设置集中管理知识库、模型、审核策略和在线文档服务。
-
-知识库配置（当前支持 Dify）：
-
-![Dify 设置](images/设置dify.png)
-
-模型配置：
-
-![模型设置](images/设置-模型.png)
-
-审核设置（并发控制、调试开关等）：
-
-![系统设置](images/设置-系统.png)
-
-开启调试开关后，可在审核界面查看完整提示词，便于排查问题和优化规则。
-
-![调试信息示例](images/DEBUG.png)
-
-OnlyOffice 对接（在线预览、编辑与下载）：
-
-![OnlyOffice 设置](images/设置-office.png)
-
-### 4. 方案审核与人工审阅
-
-可先下载方案模板进行编写，再上传发起审核。系统会将审核批注写入 Word 文档。
-
-![方案审核页面](images/方案审核.png)
-
-点击“人工审阅”可查看审核 Web 结果页面。
-
-![人工审阅页面](images/人工审阅7.png)
-
-支持预览与编辑，调用 OnlyOffice 展示文档内容。
-
-![文档预览](images/预览.png)
-
-审核完成后可直接导出文档，并在其他 Office 软件中继续编辑。
+[MIT License](LICENSE)
